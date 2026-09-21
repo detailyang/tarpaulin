@@ -1,22 +1,23 @@
 use crate::utils::get_test_path;
 use cargo_tarpaulin::{
-    config::{Color, Config, Mode},
+    config::{Config, Mode, TraceEngine},
     errors::RunError,
 };
-use cargo_tarpaulin::{launch_tarpaulin, run, setup_logging};
+use cargo_tarpaulin::{launch_tarpaulin, run};
 use rusty_fork::rusty_fork_test;
 use std::env;
+use test_log::test;
 
 rusty_fork_test! {
 
 #[test]
 fn error_if_build_script_fails() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     let test_dir = get_test_path("build_script_fail");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_clean(false);
 
     let result = launch_tarpaulin(&config, &None);
@@ -31,12 +32,12 @@ fn error_if_build_script_fails() {
 
 #[test]
 fn error_if_compilation_fails() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     let test_dir = get_test_path("compile_fail");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_clean(false);
 
     let result = launch_tarpaulin(&config, &None);
@@ -51,12 +52,12 @@ fn error_if_compilation_fails() {
 
 #[test]
 fn error_if_test_fails() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     let test_dir = get_test_path("failing_test");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_clean(false);
 
     let result = run(&[config]);
@@ -69,16 +70,32 @@ fn error_if_test_fails() {
     }
 }
 
+/// A successful test that exceeds the configured LLVM timeout must fail coverage collection.
+#[test]
+fn llvm_test_timeout() {
+    let mut config = Config::default();
+    let test_dir = get_test_path("llvm_timeout");
+    env::set_current_dir(&test_dir).expect("change to timeout fixture directory");
+    config.set_manifest(test_dir.join("Cargo.toml"));
+    config.set_engine(TraceEngine::Llvm);
+    config.set_clean(false);
+    config.test_timeout = std::time::Duration::from_secs(1);
+
+    let result = launch_tarpaulin(&config, &None);
+    assert!(matches!(result, Err(RunError::TestRuntime(_))), "{result:?}");
+}
+
 #[test]
 fn issue_610() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     let test_dir = get_test_path("issue_610");
     config.test_names.insert("foo".to_string());
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_clean(false);
+    config.set_include_tests(true);
 
     let result = run(&[config.clone()]);
     assert!(result.is_ok());

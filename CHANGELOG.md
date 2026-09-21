@@ -3,11 +3,304 @@
 From 2019 onwards, all notable changes to tarpaulin will be documented in this
 file.
 
-## [Unreleased]
+## [0.37.4] 2026-09-21
+### Changed
+- LLVM engine tests now respect `--timeout` argument
+- Repeated `-Clink-arg` values are preserved when updating rustflags and rustdocflags
+- RUSTDOCFLAGS values are joined to existing values instead of overwriting
+- Projects with markdown relevant characters in the name now don't cause markdown misrendering
+- Improve HTML reports to fix some issues (light/dark button not working, long paths overrun layout)
+
+## [0.37.3] 2026-09-19
+### Changed
+- Use `CARGO_ENCODED_RUST(DOC)FLAGS` to avoid space splitting issues 
+- Saturating add when adding two line hit counts together.
+
+## [0.37.2] 2026-08-15
+### Fixed
+- Fix LLVM 23 support for 32 bit profiles
+
+## [0.37.1] 2026-08-10
+### Added
+- LLVM 23 support to llvm engine
+
+## [0.37.0] 2026-07-04
+### Added
+- Support for wasm coverage
+
+## [0.36.0] 2026-06-29
+### Added
+- Adding support for custom cargo runners. This will be the basis of wasm and ebpf support
+- Basic feature gate evaluation to skip source analysis on ignored modules
+- Ptrace support for linux aarch64 (64 bit ARM)
+
+### Changed
+- Performance improvements in llvm profraw parsing
+
+### Fixed
+- Issue with config file and CLI merging that lead to CLI --engine being ignored if a config file is used
+
+## [0.35.5] 2026-06-21
+### Added
+- Cargo 1.94 onward the `CARGO_BIN_EXE_` env vars are now set at test runtime, replicate this when running under tarpaulin #1833
+
+### Fixed
+- Fix report generation when coverage is below threshold #1852
+
+## [0.35.4] 2026-04-25
+### Changed
+- Revert gimli to a non-yanked version
+
+## [0.35.3] 2026-04-25 [YANKED]
+### Changed
+- Refined the forced coverage of generic items and expressions to reduce false negatives
+
+### Fixed
+- Fix ptrace SIGILL issue where PID parent event is delivered in iteration after the child stop is reported
+
+## [0.35.2] 2026-02-19
+### Fixed
+- Update native-tls to fix install issue after breaking change.
+
+## [0.35.1] 2026-01-16
+### Fixed
+- Fix filtering of integration test folders in workspaces
+
+## [0.35.0] 2026-01-01
+### Changed
+- Update LLVM profile parsing code to lazily load files reducing memory usage
+- HTML reports now display the hit count without a mouseover
+- Don't override `RUST_BACKTRACE` if it's already set in the env when using `--verbose`
+- Don't report delta coverage if run configuration changes in a way that would lead to meaningless results
+
+### Fixed
+- Correctly trace module paths when ignoring file modules declared in an inline module #1974
+ 
+## [0.34.1] 2025-10-24
+### Changed
+- Silence warning on invalid/unexpected doctest path for merged doctests as they
+don't need the old processing
+
+### Fixed
+- LLVM split regions are now counted correctly fixing some missed coverage hits.
+
+## [0.34.0] 2025-10-19
+### Added
+- Support for [env] section in `.cargo/config`
+- Full resolution of `.cargo/config` file hierarchy
+
+## [0.33.0] 2025-10-05
+### Added
+- Markdown report type
+
+### Changed
+- Made all reports consistent and put them in the project root by default
+- Add dark/light mode to HTML reports
+
+## [0.32.8] 2025-06-23
+### Changed
+- cargo metadata command no longer runs with `--all-features`
+
+## [0.32.7] 2025-05-20
+### Changed
+- Update `llvm_profparser` to remove a panic
+- Only bring in num-cpus for ptrace builds
+
+## [0.32.6] 2025-05-20
+### Changed
+- Update `llvm_profparser`
+- Enable lto for release builds
+
+## [0.32.5] 2025-05-06
+### Changed
+- Change some types so x86 starts working properly
+- Performance improvements for llvm profraw report generation via [llvm-profparsers#48](https://github.com/xd009642/llvm-profparser/pull/48)
+
+## [0.32.4] 2025-05-03
+### Changed
+- Performance improvements for llvm profraw report generation
+
+## [0.32.3] 2025-03-12
+### Changed
+- Ignore rlib files in doctest folder
+
+## [0.32.2] 2025-03-04
+### Changed
+- Now submit git remote information to coveralls and log the report URL as well as better error handling
+
+## [0.32.1] 2025-03-03
+### Fixed
+- Merged doctests now work in coverage
+
+## [0.32.0] 2025-02-14
+### Changed
+- doctest name resolution changed to be exact match not suffix match. This should only break doc test coverage
+for nightlies >1 year old
+- Fixed handling of dashes in doctest name resolution
+- Now disable dead code inclusion for mac's by default due to [rust-lang/rust#137009](https://github.com/rust-lang/rust/issues/137009)
+- Remove link-dead-code from llvm engine coverage jobs
+
+## [0.31.5] 2025-01-16
+### Changed
+- ASLR detection was slightly broken - although it wouldn't break anything unless setting was broken as well.
+- Detect the libdir path by rustc and link to it to enable proc-macro test binaries to run without error #1642
+
+## [0.31.4] 2024-12-31
+### Added
+- Added `--include-files` argument to only display coverage for the mentioned files (#1667)
+
+## [0.31.3] 2024-11-29
+### Added
+- The `CARGO_TARPAULIN_CONFIG_FILE` environment variable may be used to set the
+  path to the configuration file. The command line argument has precedence,
+  but this environment variable has precedence over `tarpaulin.toml` and `.tarpaulin.toml`.
+
+### Changed
+- For `LD_LIBRARY_PATH` get all link paths from build script outputs
+- Use `PATH` on windows and `DYLIB_LIBRARY_PATH` for mac instead of `LD_LIBRARY_PATH`
+- Add `--stderr` flag to print tarpaulin logs to stderr
+
+## [0.31.2] 2024-08-20
+### Changed
+- Removed debug printout of function map
+
+## [0.31.1] 2024-08-05
+### Added
+- Support for `#[coverage(off)]` to exclude expressions from coverage results
+- Updated llvm_profparsers to llvm-19 version
+
+## [0.31.0] 2024-07-22 
+### Added
+- Ability to remove coveralls from the build making openssl optional.
+
+### Changed
+- No longer print rustflags for report configs with `--print-rust-flags` 
+- Now use source code to get function names and locations instead of debug information
+
+## [0.30.0] 2024-05-10
+### Changed
+- Upgraded to syn2 and removed branch coverage module. This only had impact in debug dumps so shouldn't impact users
+- Ignore type definitions in trait implementations
+- Upgrade llvm-profparsers crate and now use sub-report filtering to skip dependency only coverage stats
+
+## [0.29.2] 2024-05-08
+### Changed
+- Update jobserver crate to allow building on alpine
+
+## [0.29.1] 2024-05-03
+### Added
+- Use `RUSTUP_HOME` to handle rustup being installed in non-standard directories
+
+## [0.29.0] 2024-05-01
+### Added 
+- Troubleshooting guide 
+
+### Changed
+- Now override toolchain less-eagerly in windows #1494
+- Fixed build for x86
+- Add summary coverage, covered and coverable to json report #1415
+- Pass RUSTFLAGS to the binary under test for any project bins compiled during test
+- Force coverage of generic functions/methods using `impl Trait` args
+
+## [0.28.0] 2024-04-13
+### Changed
+- No longer add `+nightly` if cargo version is already nightly
+- Adds `-Cstrip=None` to the rustflags to prevent default stripping
+- Update profparsers for llvm 17 and 18 support
+
+## [0.27.3] 2024-01-13
+### Changed
+- Add line reports and make file name float in HTML report
+- Make coverallss report path match linux path format on windows
+
+## [0.27.2] 2023-11-28
+### Changed
+- Don't disable ASLR if it's already disabled
+
+## [0.27.1] 2023-10-02
+### Changed
+- Restore casing of enum clap arguments e.g. `--out` so they match old behaviour
+
+## [0.27.0] 2023-09-17
+### Added
+- Added `--fail-immediately` flag to abort execution the moment the first test failure occurs
+
+### Changed
+- Upgraded from clap v2 to v4. This has a few changes, notably any arguments which can be specified more
+than once require multiple entries so `--run-types doc test` needs to be turned into `--run-types doc --run-types test`
+- Ignore attributes on methods, functions and trait methods
+
+## [0.26.1] 2023-07-02
+### Changed
+- Expand doc test prefix to cover more of the directory tree to work with the new naming structure
+- Handle -A -W and -D flags in the RUSTFLAGS deduplication
+- Ignore `//` comments as well as `///`
+
+## [0.26.0] 2023-06-16
+### Changed
+- Match `cargo test` behaviour for --no-fail-fast and report coverage when option is selected
+- Simplify cargo version parsing for rust installed via distro package managers
+
+### Removed
+- Unused utility methods on json report type
+
+### Fixed
+- Fix handling of `--all-targets` flag
+
+## [0.25.2] 2023-04-04
+### Added
+- Filtering for other test attributes such as `#[tokio::test]`
+
+### Changed
+- Update to newer faster `llvm_profparser`
+
+## [0.25.1] 2023-02-26
+### Changed
+- Improve logs for processing stripped projects with ptrace
+- Skip missing objects provided by `--objects` if they aren't present when getting reports
+- No longer canonicalise potentially missing paths for `--objects`
+
+## [0.25.0] 2023-01-30
+### Added
+- `--objects` argument to provide other object files with coverage information 
+- `--no-dead-code` flag to avoid adding `-Clink-dead-code` to linker flags
+- ptrace support for x86
+
+### Changed
+- Dumped traces are now saved to reports output directory
+- Change event log name to print datetime stamps without colons or slashes so they'll save in other
+operating systems
+- Set `LLVM_PROFILE_FILE` for building tests and delete the generated profraws to ignore build script
+coverage 
+- Remove dependency on memmap
+- Filter out expressions or items with `#[cfg_attr(tarpaulin, no_coverage)]`
+
+## [0.24.0] 2023-01-24
+### Added
+- Merge rustdocflags field from `cargo/config.toml` with env tarpaulin sets
+
+### Changed
+- Create profraw folder if it doesn't exist
+- Normalise UNC paths provided via env or CLI args
+- Make output directory crate root if not provided
+- If root is not provided fall-back to root from manifest for base directory when printing
+reports not the current directory
+- Change exclude-files pattern to use glob crate instead of a regex
+- Set `LLVM_PROFILE_FILE` so profraw files go directly to target dir
+- Make llvm coverage single threaded to avoid concurrency issues when writing profraw files
+
+## [0.23.1] 2022-11-18
+### Changed
+- Fix linux cfg instead of ptrace\_supported cfg on event log for ARM linux builds
+
+## [0.23.0] 2022-11-18
 ### Changed
 - Look for existing profraws before spawning test
 - Add empty `<a>` wrapping elements to improve mouseless navigation of HTML reports #1120 
 - Disable ptrace engine support for non-x64 architectures
+
+### Removed
+- Travis install script - users should use one of the other fast install tools
 
 ## [0.22.0] 2022-10-09
 ### Added
@@ -52,7 +345,7 @@ file.
 
 ### Changed
 - Support skip-clean in config files and implement prioritisation in merges
-- Fix issue where in a workspace wih different run types the package IDs can become misaligned with test binaries
+- Fix issue where in a workspace with different run types the package IDs can become misaligned with test binaries
 
 ## [0.19.0] 2021-12-27
 ### Added

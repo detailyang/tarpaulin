@@ -1,26 +1,26 @@
+use crate::Config;
+use crate::TestHandle;
+use crate::cargo::{CargoConfigFields, TestBinary};
 use crate::config::types::Mode;
 use crate::errors::*;
+use crate::process_handling::event_source::{EventSource, PtraceEventSource};
 use crate::process_handling::execute_test;
-use crate::ptrace_control::*;
-use crate::Config;
-use crate::TestBinary;
-use crate::TestHandle;
-use lazy_static::lazy_static;
 use nix::sched::*;
 use nix::sys::personality;
 use nix::unistd::*;
 use std::ffi::{CStr, CString};
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::LazyLock;
 use tracing::{info, warn};
 
-lazy_static! {
-    static ref NUM_CPUS: usize = num_cpus::get();
-}
+static NUM_CPUS: LazyLock<usize> = LazyLock::new(|| num_cpus::get());
 
 /// Returns the coverage statistics for a test executable in the given workspace
 pub fn get_test_coverage(
     test: &TestBinary,
     config: &Config,
+    cargo_config: Rc<CargoConfigFields>,
     ignored: bool,
 ) -> Result<Option<TestHandle>, RunError> {
     if !test.path().exists() {
@@ -44,7 +44,7 @@ pub fn get_test_coverage(
                     Mode::Build => "binary",
                 };
                 info!("Launching {}", bin_type);
-                execute_test(test, &[], ignored, config, Some(threads))?;
+                execute_test(test, &[], ignored, config, cargo_config, Some(threads))?;
                 Ok(None)
             }
             Err(err) => Err(RunError::TestCoverage(format!(
@@ -59,6 +59,12 @@ pub fn get_test_coverage(
 fn disable_aslr() -> nix::Result<()> {
     let this = personality::get()?;
     personality::set(this | personality::Persona::ADDR_NO_RANDOMIZE).map(|_| ())
+}
+
+fn is_aslr_enabled() -> bool {
+    !personality::get()
+        .map(|x| x.contains(personality::Persona::ADDR_NO_RANDOMIZE))
+        .unwrap_or(true)
 }
 
 pub fn limit_affinity() -> nix::Result<()> {
@@ -84,13 +90,17 @@ pub fn execute(
     envar: &[(String, String)],
 ) -> Result<TestHandle, RunError> {
     let program = CString::new(test.display().to_string()).unwrap_or_default();
-    disable_aslr().map_err(|e| RunError::TestRuntime(format!("ASLR disable failed: {}", e)))?;
-
-    request_trace().map_err(|e| RunError::Trace(e.to_string()))?;
+    if is_aslr_enabled() {
+        disable_aslr().map_err(|e| RunError::TestRuntime(format!("ASLR disable failed: {e}")))?;
+    }
+    let event_source = PtraceEventSource;
+    event_source
+        .request_trace()
+        .map_err(|e| RunError::Trace(e.to_string()))?;
 
     let envar = envar
         .iter()
-        .map(|(k, v)| CString::new(format!("{}={}", k, v).as_str()).unwrap_or_default())
+        .map(|(k, v)| CString::new(format!("{k}={v}").as_str()).unwrap_or_default())
         .collect::<Vec<CString>>();
 
     let argv = argv
@@ -103,4 +113,16 @@ pub fn execute(
     execve(&program, &arg_ref, &env_ref).map_err(|_| RunError::Internal)?;
 
     unreachable!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn can_disable_aslr() {
+        assert!(is_aslr_enabled());
+        disable_aslr().unwrap();
+        assert!(!is_aslr_enabled());
+    }
 }

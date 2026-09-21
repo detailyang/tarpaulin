@@ -1,24 +1,51 @@
-use clap::arg_enum;
+use clap::ValueEnum;
+#[cfg(feature = "coveralls")]
 use coveralls_api::CiService;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::str::FromStr;
 
-arg_enum! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize)]
-    pub enum Color {
-        Auto,
-        Always,
-        Never,
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize, ValueEnum,
+)]
+#[value(rename_all = "PascalCase")]
+pub enum Color {
+    Auto,
+    Always,
+    Never,
+}
+
+impl fmt::Display for Color {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Color::Auto => write!(f, "Auto"),
+            Color::Always => write!(f, "Always"),
+            Color::Never => write!(f, "Never"),
+        }
     }
 }
 
-arg_enum! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize)]
-    pub enum TraceEngine {
-        Auto,
-        Ptrace,
-        Llvm,
-    }
+#[derive(
+    Debug,
+    Default,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Ord,
+    PartialOrd,
+    Deserialize,
+    Serialize,
+    ValueEnum,
+)]
+#[value(rename_all = "PascalCase")]
+pub enum TraceEngine {
+    Auto,
+    #[cfg_attr(ptrace_default, default)]
+    Ptrace,
+    #[cfg_attr(not(ptrace_default), default)]
+    Llvm,
 }
 
 impl TraceEngine {
@@ -33,61 +60,77 @@ impl TraceEngine {
     }
 }
 
-impl Default for TraceEngine {
-    fn default() -> Self {
-        cfg_if::cfg_if! {
-            if #[cfg(ptrace_supported)] {
-                TraceEngine::Ptrace
-            } else {
-                TraceEngine::Llvm
-            }
-        }
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize, ValueEnum,
+)]
+#[value(rename_all = "PascalCase")]
+pub enum Mode {
+    Test,
+    Build,
+}
+
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize, ValueEnum,
+)]
+#[value(rename_all = "PascalCase")]
+pub enum RunType {
+    Tests,
+    Doctests,
+    Benchmarks,
+    Examples,
+    Lib,
+    Bins,
+    AllTargets,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(ptrace_default)]
+    fn ptrace_default_platforms_default_to_ptrace() {
+        assert_eq!(TraceEngine::default(), TraceEngine::Ptrace);
+    }
+
+    #[test]
+    #[cfg(not(ptrace_default))]
+    fn non_ptrace_default_platforms_default_to_llvm() {
+        assert_eq!(TraceEngine::default(), TraceEngine::Llvm);
     }
 }
 
-arg_enum! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize)]
-    pub enum Mode {
-        Test,
-        Build
-    }
+#[derive(
+    Debug,
+    Default,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Deserialize,
+    Serialize,
+    ValueEnum,
+)]
+#[value(rename_all = "PascalCase")]
+#[non_exhaustive]
+pub enum OutputFile {
+    Json,
+    #[default]
+    Stdout,
+    Xml,
+    Html,
+    Lcov,
+    Markdown,
 }
 
-arg_enum! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Deserialize, Serialize)]
-    pub enum RunType {
-        Tests,
-        Doctests,
-        Benchmarks,
-        Examples,
-        Lib,
-        Bins,
-        AllTargets,
-    }
-}
-
-arg_enum! {
-    #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-    #[non_exhaustive]
-    pub enum OutputFile {
-        Json,
-        Stdout,
-        Xml,
-        Html,
-        Lcov,
-    }
-}
-
-impl Default for OutputFile {
-    #[inline]
-    fn default() -> Self {
-        OutputFile::Stdout
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[cfg(feature = "coveralls")]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
 pub struct Ci(pub CiService);
 
+#[cfg(feature = "coveralls")]
 impl FromStr for Ci {
     /// This can never fail, so the error type is uninhabited.
     type Err = std::convert::Infallible;

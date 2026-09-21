@@ -1,11 +1,17 @@
+#[cfg(ptrace_supported)]
+use crate::breakpoint::BREAKPOINT_PC_OFFSET;
 use crate::cargo::TestBinary;
+use crate::config::Config;
 #[cfg(ptrace_supported)]
 use crate::ptrace_control::*;
 #[cfg(ptrace_supported)]
 use crate::statemachine::ProcessInfo;
+#[cfg(ptrace_supported)]
 use crate::statemachine::TracerAction;
-use crate::traces::{Location, TraceMap};
-use chrono::{offset::Local, SecondsFormat};
+use crate::traces::Location;
+#[cfg(ptrace_supported)]
+use crate::traces::TraceMap;
+use chrono::offset::Local;
 #[cfg(ptrace_supported)]
 use nix::libc::*;
 #[cfg(ptrace_supported)]
@@ -14,9 +20,19 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{info, warn};
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventLog {
+    events: RefCell<Vec<EventWrapper>>,
+    #[serde(skip)]
+    start: Option<Instant>,
+    manifest_paths: HashSet<PathBuf>,
+    #[serde(skip)]
+    output_folder: PathBuf,
+}
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Event {
@@ -53,7 +69,7 @@ pub struct TraceEvent {
 }
 
 impl TraceEvent {
-    #[cfg(target_os = "linux")]
+    #[cfg(ptrace_supported)]
     pub(crate) fn new_from_action(action: &TracerAction<ProcessInfo>) -> Self {
         match action {
             TracerAction::TryContinue(t) => TraceEvent {
@@ -105,7 +121,9 @@ impl TraceEvent {
                 event.signal = Some(sig.to_string());
                 if *sig == Signal::SIGTRAP {
                     event.description = "Stopped".to_string();
-                    event.addr = current_instruction_pointer(*c).ok().map(|x| (x - 1) as u64);
+                    event.addr = current_instruction_pointer(*c)
+                        .ok()
+                        .map(|x| (x as u64).saturating_sub(BREAKPOINT_PC_OFFSET));
                     if let Some(addr) = event.addr {
                         event.location = traces.get_location(addr - offset);
                     }
@@ -119,19 +137,19 @@ impl TraceEvent {
                     PTRACE_EVENT_CLONE => {
                         event.description = "Ptrace Clone".to_string();
                         if *sig == Signal::SIGTRAP {
-                            event.child = get_event_data(*pid).ok();
+                            event.child = get_event_data(*pid).ok().map(|x| x as i64);
                         }
                     }
                     PTRACE_EVENT_FORK => {
                         event.description = "Ptrace fork".to_string();
                         if *sig == Signal::SIGTRAP {
-                            event.child = get_event_data(*pid).ok();
+                            event.child = get_event_data(*pid).ok().map(|x| x as i64);
                         }
                     }
                     PTRACE_EVENT_VFORK => {
                         event.description = "Ptrace vfork".to_string();
                         if *sig == Signal::SIGTRAP {
-                            event.child = get_event_data(*pid).ok();
+                            event.child = get_event_data(*pid).ok().map(|x| x as i64);
                         }
                     }
                     PTRACE_EVENT_EXEC => {
@@ -159,20 +177,13 @@ impl TraceEvent {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventLog {
-    events: RefCell<Vec<EventWrapper>>,
-    #[serde(skip)]
-    start: Option<Instant>,
-    manifest_paths: HashSet<PathBuf>,
-}
-
 impl EventLog {
-    pub fn new(manifest_paths: HashSet<PathBuf>) -> Self {
+    pub fn new(manifest_paths: HashSet<PathBuf>, config: &Config) -> Self {
         Self {
             events: RefCell::new(vec![]),
             start: Some(Instant::now()),
             manifest_paths,
+            output_folder: config.output_dir(),
         }
     }
 
@@ -214,15 +225,12 @@ impl EventLog {
 
 impl Drop for EventLog {
     fn drop(&mut self) {
-        let fname = format!(
-            "tarpaulin_{}.json",
-            Local::now().to_rfc3339_opts(SecondsFormat::Secs, false)
-        );
-        let path = Path::new(&fname);
+        let fname = format!("tarpaulin_{}.json", Local::now().format("%Y%m%d%H%M%S"));
+        let path = self.output_folder.join(fname);
         info!("Serializing tarpaulin debug log to {}", path.display());
         if let Ok(output) = File::create(path) {
             if let Err(e) = serde_json::to_writer(output, self) {
-                warn!("Failed to serialise or write result: {}", e);
+                warn!("Failed to serialise or write result: {e}");
             }
         } else {
             warn!("Failed to create log file");

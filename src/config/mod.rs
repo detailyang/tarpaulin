@@ -1,19 +1,20 @@
 use self::parse::*;
 pub use self::types::*;
-use crate::cargo::supports_llvm_coverage;
 use crate::path_utils::fix_unc_path;
-use cargo_metadata::{Metadata, MetadataCommand, Package};
-use clap::{value_t, ArgMatches};
+use crate::traces::TraceMapSettings;
+use crate::{args::ConfigArgs, cargo::supports_llvm_coverage};
+use cargo_metadata::{Metadata, MetadataCommand};
+#[cfg(feature = "coveralls")]
 use coveralls_api::CiService;
+use glob::Pattern;
 use humantime_serde::deserialize as humantime_serde;
 use indexmap::IndexMap;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cell::{Ref, RefCell};
 use std::collections::HashSet;
 use std::env;
-use std::fs::File;
-use std::io::{Error, ErrorKind, Read};
+use std::fs;
+use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -31,7 +32,7 @@ pub struct Config {
     pub name: String,
     /// Path to the projects cargo manifest
     #[serde(rename = "manifest-path")]
-    pub manifest: PathBuf,
+    manifest: PathBuf,
     /// Path to a tarpaulin.toml config file
     pub config: Option<PathBuf>,
     /// Path to the projects cargo manifest
@@ -39,9 +40,6 @@ pub struct Config {
     /// Flag to also run tests with the ignored attribute
     #[serde(rename = "ignored")]
     pub run_ignored: bool,
-    /// Flag to ignore test functions in coverage statistics
-    #[serde(rename = "ignore-tests")]
-    ignore_tests: bool,
     /// Ignore panic macros in code.
     #[serde(rename = "ignore-panics")]
     pub ignore_panics: bool,
@@ -51,8 +49,6 @@ pub struct Config {
     /// The opposite of --force-clean
     #[serde(rename = "skip-clean")]
     skip_clean: bool,
-    #[serde(rename = "all-targets")]
-    pub all_targets: bool,
     /// Verbose flag for printing information to the user
     pub verbose: bool,
     /// Debug flag for printing internal debugging information to the user
@@ -75,6 +71,7 @@ pub struct Config {
     pub coveralls: Option<String>,
     /// Enum representing CI tool used.
     #[serde(rename = "ciserver", deserialize_with = "deserialize_ci_server")]
+    #[cfg(feature = "coveralls")]
     pub ci_tool: Option<CiService>,
     /// Only valid if coveralls option is set. If coveralls option is set,
     /// as well as report_uri, then the report will be sent to this endpoint
@@ -85,6 +82,9 @@ pub struct Config {
     /// rely on signals to work.
     #[serde(rename = "forward")]
     pub forward_signals: bool,
+    /// Doesn't link projects with `-Clink-dead-code`
+    #[serde(rename = "no-dead-code")]
+    pub no_dead_code: bool,
     /// Include all available features in target build
     #[serde(rename = "all-features")]
     pub all_features: bool,
@@ -124,10 +124,16 @@ pub struct Config {
     pub exclude: Vec<String>,
     /// Files to exclude from testing in their compiled form
     #[serde(skip_deserializing, skip_serializing)]
-    excluded_files: RefCell<Vec<Regex>>,
+    excluded_files: RefCell<Vec<glob::Pattern>>,
     /// Files to exclude from testing in uncompiled form (for serde)
     #[serde(rename = "exclude-files")]
     excluded_files_raw: Vec<String>,
+    /// Files to include in testing in their compiled form
+    #[serde(skip_deserializing, skip_serializing)]
+    included_files: RefCell<Vec<glob::Pattern>>,
+    /// Files to include in testing in uncompiled form (for serde)
+    #[serde(rename = "include-files")]
+    included_files_raw: Vec<String>,
     /// Varargs to be forwarded to the test executables.
     #[serde(rename = "args")]
     pub varargs: Vec<String>,
@@ -175,17 +181,24 @@ pub struct Config {
     #[serde(rename = "implicit-test-threads")]
     pub implicit_test_threads: bool,
     /// Engine to use to collect coverage
-    engine: RefCell<TraceEngine>,
+    engine: RefCell<Option<TraceEngine>>,
     /// Specifying per-config rust flags
     pub rustflags: Option<String>,
+    /// Flag to include test functions in coverage statistics
     #[serde(rename = "include-tests")]
-    /// Inverse of ignore_tests
     include_tests: bool,
     #[serde(rename = "post-test-delay")]
     /// Delay after test to collect instrumentation files (LLVM only)
     pub post_test_delay: Option<Duration>,
+    /// Other objects that should be included to get counter values from for instrumentation
+    /// coverage
+    objects: Vec<PathBuf>,
     /// Joined to target/tarpaulin to store profraws
     profraw_folder: PathBuf,
+    /// Option to fail immediately after a single test fails
+    pub fail_immediately: bool,
+    /// Log to stderr instead
+    pub stderr: bool,
 }
 
 fn default_test_timeout() -> Duration {
@@ -202,22 +215,25 @@ impl Default for Config {
             config: None,
             root: Default::default(),
             run_ignored: false,
-            all_targets: false,
-            ignore_tests: true,
             include_tests: false,
             ignore_panics: false,
             force_clean: true,
             skip_clean: false,
+            no_dead_code: false,
             verbose: false,
             debug: false,
             follow_exec: false,
+            #[cfg(not(test))]
             dump_traces: false,
+            #[cfg(test)]
+            dump_traces: true,
             count: false,
             line_coverage: true,
             branch_coverage: false,
             generate: vec![],
             output_directory: Default::default(),
             coveralls: None,
+            #[cfg(feature = "coveralls")]
             ci_tool: None,
             report_uri: None,
             forward_signals: true,
@@ -229,6 +245,8 @@ impl Default for Config {
             exclude: vec![],
             excluded_files: RefCell::new(vec![]),
             excluded_files_raw: vec![],
+            included_files: RefCell::new(vec![]),
+            included_files_raw: vec![],
             varargs: vec![],
             test_timeout: default_test_timeout(),
             release: false,
@@ -254,29 +272,26 @@ impl Default for Config {
             engine: RefCell::default(),
             rustflags: None,
             post_test_delay: Some(Duration::from_secs(1)),
+            objects: vec![],
             profraw_folder: PathBuf::from("profraws"),
+            fail_immediately: false,
+            stderr: false,
         }
     }
 }
 
-impl<'a> From<&'a ArgMatches<'a>> for ConfigWrapper {
-    fn from(args: &'a ArgMatches<'a>) -> Self {
+impl From<ConfigArgs> for ConfigWrapper {
+    fn from(args: ConfigArgs) -> Self {
         info!("Creating config");
-        let debug = args.is_present("debug");
-        let dump_traces = debug || args.is_present("dump-traces");
-        let verbose = args.is_present("verbose") || debug;
-        let excluded_files = get_excluded(args);
-        let excluded_files_raw = get_list(args, "exclude-files");
-        let features = get_list(args, "features");
+
+        let features = args.features;
         let features = if features.is_empty() {
             None
         } else {
             Some(features.join(" "))
         };
-        let force_clean = match (
-            args.is_present("force-clean"),
-            args.is_present("skip-clean"),
-        ) {
+
+        let force_clean = match (args.force_clean, args.skip_clean) {
             (true, false) | (false, false) => true,
             (false, true) => false,
             _ => {
@@ -285,74 +300,76 @@ impl<'a> From<&'a ArgMatches<'a>> for ConfigWrapper {
             }
         };
 
-        let engine = value_t!(args.value_of("engine"), TraceEngine).unwrap_or_default();
-
         let args_config = Config {
             name: String::new(),
-            manifest: get_manifest(args),
+            manifest: process_manifest(args.manifest_path, args.root.clone()),
             config: None,
-            root: get_root(args),
-            engine: RefCell::new(engine),
-            command: value_t!(args.value_of("command"), Mode).unwrap_or(Mode::Test),
-            color: value_t!(args.value_of("color"), Color).unwrap_or(Color::Auto),
-            run_types: get_run_types(args),
-            run_ignored: args.is_present("ignored"),
-            ignore_tests: !args.is_present("include-tests"),
-            include_tests: args.is_present("include-tests"),
-            ignore_panics: args.is_present("ignore-panics"),
+            root: args.root,
+            engine: RefCell::new(args.engine),
+            command: args.command.unwrap_or(Mode::Test),
+            verbose: args.logging.verbose || args.logging.debug,
+            debug: args.logging.debug,
+            dump_traces: args.logging.debug || args.logging.dump_traces,
+            color: args.logging.color.unwrap_or(Color::Auto),
+            run_types: args.run_types.collect(),
+            run_ignored: args.ignored,
+            include_tests: args.include_tests,
+            ignore_panics: args.ignore_panics,
+            no_dead_code: args.no_dead_code,
             force_clean,
             skip_clean: !force_clean,
-            no_fail_fast: args.is_present("no-fail-fast"),
-            all_targets: args.is_present("all-targets"),
-            follow_exec: args.is_present("follow-exec"),
-            verbose,
-            debug,
-            dump_traces,
-            count: args.is_present("count"),
-            line_coverage: get_line_cov(args),
-            branch_coverage: get_branch_cov(args),
-            generate: get_outputs(args),
-            output_directory: get_output_directory(args),
-            coveralls: get_coveralls(args),
-            ci_tool: get_ci(args),
-            report_uri: get_report_uri(args),
+            no_fail_fast: args.no_fail_fast,
+            follow_exec: args.follow_exec,
+            count: args.count,
+            line_coverage: args.line || !args.branch,
+            branch_coverage: args.branch || !args.line,
+            generate: args.out,
+            output_directory: args.output_dir,
+            coveralls: args.coveralls,
+            #[cfg(feature = "coveralls")]
+            ci_tool: args.ciserver.map(|c| c.0),
+            report_uri: args.report_uri,
             forward_signals: true, // No longer an option
-            all_features: args.is_present("all-features"),
-            no_default_features: args.is_present("no-default-features"),
+            all_features: args.all_features,
+            no_default_features: args.no_default_features,
             features,
-            unstable_features: get_list(args, "Z"),
-            all: args.is_present("all") | args.is_present("workspace"),
-            packages: get_list(args, "packages"),
-            exclude: get_list(args, "exclude"),
-            excluded_files: RefCell::new(excluded_files),
-            excluded_files_raw,
-            varargs: get_list(args, "args"),
-            test_timeout: get_timeout(args),
-            release: args.is_present("release"),
-            no_run: args.is_present("no-run"),
-            locked: args.is_present("locked"),
-            frozen: args.is_present("frozen"),
-            target: get_target(args),
-            target_dir: get_target_dir(args),
-            offline: args.is_present("offline"),
-            test_names: get_list(args, "test").iter().cloned().collect(),
-            bin_names: get_list(args, "bin").iter().cloned().collect(),
-            bench_names: get_list(args, "bench").iter().cloned().collect(),
-            example_names: get_list(args, "example").iter().cloned().collect(),
-            fail_under: value_t!(args.value_of("fail-under"), f64).ok(),
-            jobs: value_t!(args.value_of("jobs"), usize).ok(),
-            profile: get_profile(args),
+            unstable_features: args.unstable_features,
+            all: args.all | args.workspace,
+            packages: args.packages,
+            exclude: args.exclude,
+            excluded_files_raw: args.exclude_files.iter().map(Pattern::to_string).collect(),
+            excluded_files: RefCell::new(args.exclude_files),
+            included_files_raw: args.include_files.iter().map(Pattern::to_string).collect(),
+            included_files: RefCell::new(args.include_files),
+            varargs: args.args,
+            test_timeout: Duration::from_secs(args.timeout.unwrap_or(60)),
+            release: args.release,
+            no_run: args.no_run,
+            locked: args.locked,
+            frozen: args.frozen,
+            target: args.target,
+            target_dir: process_target_dir(args.target_dir),
+            offline: args.offline,
+            test_names: args.test.into_iter().collect(),
+            bin_names: args.bin.into_iter().collect(),
+            bench_names: args.bench.into_iter().collect(),
+            example_names: args.example.into_iter().collect(),
+            fail_under: args.fail_under,
+            jobs: args.jobs,
+            profile: args.profile,
             metadata: RefCell::new(None),
-            avoid_cfg_tarpaulin: args.is_present("avoid-cfg-tarpaulin"),
-            implicit_test_threads: args.is_present("implicit-test-threads"),
-            rustflags: get_rustflags(args),
-            post_test_delay: get_post_test_delay(args),
+            avoid_cfg_tarpaulin: args.avoid_cfg_tarpaulin,
+            implicit_test_threads: args.implicit_test_threads,
+            rustflags: args.rustflags,
+            post_test_delay: args.post_test_delay.map(Duration::from_secs),
+            objects: canonicalize_paths(args.objects),
             profraw_folder: PathBuf::from("profraws"),
+            fail_immediately: args.fail_immediately,
+            stderr: args.logging.stderr,
         };
-        if args.is_present("ignore-config") {
+        if args.ignore_config {
             Self(vec![args_config])
-        } else if args.is_present("config") {
-            let mut path = PathBuf::from(args.value_of("config").unwrap());
+        } else if let Some(mut path) = args.config {
             if path.is_relative() {
                 path = env::current_dir()
                     .unwrap()
@@ -360,10 +377,10 @@ impl<'a> From<&'a ArgMatches<'a>> for ConfigWrapper {
                     .canonicalize()
                     .unwrap();
             }
-            let confs = Config::load_config_file(&path);
+            let confs = Config::load_config_file(path);
             Config::get_config_vec(confs, args_config)
         } else if let Some(cfg) = args_config.check_for_configs() {
-            let confs = Config::load_config_file(&cfg);
+            let confs = Config::load_config_file(cfg);
             Config::get_config_vec(confs, args_config)
         } else {
             Self(vec![args_config])
@@ -375,13 +392,15 @@ impl Config {
     /// This returns the engine selected for tarpaulin to run. This function will not return Auto
     /// instead it will resolve to the best-fit `TraceEngine` for the given configuration
     pub fn engine(&self) -> TraceEngine {
-        let engine = *self.engine.borrow();
+        let engine = self.engine.borrow().unwrap_or_default();
         match engine {
             TraceEngine::Auto | TraceEngine::Llvm if supports_llvm_coverage() => TraceEngine::Llvm,
             engine => {
                 if engine == TraceEngine::Llvm {
-                    error!("unable to utilise llvm coverage, due to compiler support. Falling back to Ptrace");
-                    self.engine.replace(TraceEngine::Ptrace);
+                    error!(
+                        "unable to utilise llvm coverage, due to compiler support. Falling back to Ptrace"
+                    );
+                    self.engine.replace(Some(TraceEngine::Ptrace));
                 }
                 TraceEngine::Ptrace
             }
@@ -389,7 +408,19 @@ impl Config {
     }
 
     pub fn set_engine(&self, engine: TraceEngine) {
-        self.engine.replace(engine);
+        self.engine.replace(Some(engine));
+    }
+
+    pub fn get_tracemap_settings(&self) -> TraceMapSettings {
+        TraceMapSettings {
+            packages: self.packages.clone().into_iter().collect(),
+            workspace: self.all,
+            excluded_files_raw: self.excluded_files_raw.clone().into_iter().collect(),
+            included_files_raw: self.included_files_raw.clone().into_iter().collect(),
+            exclude: self.exclude.clone().into_iter().collect(),
+            run_types: self.run_types.clone().into_iter().collect(),
+            varargs: self.varargs.clone().into_iter().collect(),
+        }
     }
 
     pub fn set_clean(&mut self, clean: bool) {
@@ -397,13 +428,12 @@ impl Config {
         self.skip_clean = !clean;
     }
 
-    pub fn set_ignore_tests(&mut self, ignore: bool) {
-        self.ignore_tests = ignore;
-        self.include_tests = !ignore;
+    pub fn set_include_tests(&mut self, include: bool) {
+        self.include_tests = include;
     }
 
-    pub fn ignore_tests(&self) -> bool {
-        self.ignore_tests || !self.include_tests
+    pub fn include_tests(&self) -> bool {
+        self.include_tests
     }
 
     pub fn force_clean(&self) -> bool {
@@ -413,7 +443,7 @@ impl Config {
     }
 
     pub fn target_dir(&self) -> PathBuf {
-        if let Some(s) = &self.target_dir {
+        let res = if let Some(s) = &self.target_dir {
             s.clone()
         } else {
             match *self.get_metadata() {
@@ -421,11 +451,12 @@ impl Config {
                 _ => self
                     .manifest
                     .parent()
-                    .map(Path::to_path_buf)
+                    .map(fix_unc_path)
                     .unwrap_or_default()
                     .join("target"),
             }
-        }
+        };
+        fix_unc_path(&res)
     }
 
     /// Get directory profraws are stored in
@@ -445,14 +476,19 @@ impl Config {
         self.profraw_folder = path;
     }
 
+    /// Sets the target dir explicitly
+    pub fn set_target_dir(&mut self, target_dir: PathBuf) {
+        self.target_dir = Some(target_dir);
+    }
+
     pub fn doctest_dir(&self) -> PathBuf {
         // https://github.com/rust-lang/rust/issues/98690
-        let mut result = fix_unc_path(&self.target_dir());
+        let mut result = self.target_dir();
         result.push("doctests");
         result
     }
 
-    pub(crate) fn get_metadata(&self) -> Ref<Option<Metadata>> {
+    pub(crate) fn get_metadata(&self) -> Ref<'_, Option<Metadata>> {
         if self.metadata.borrow().is_none() {
             match MetadataCommand::new().manifest_path(&self.manifest).exec() {
                 Ok(meta) => {
@@ -463,26 +499,38 @@ impl Config {
         }
         self.metadata.borrow()
     }
+
     pub fn root(&self) -> PathBuf {
-        match *self.get_metadata() {
+        let res = match *self.get_metadata() {
             Some(ref meta) => PathBuf::from(meta.workspace_root.clone()),
-            _ => self.manifest.parent().map(fix_unc_path).unwrap_or_default(),
-        }
+            _ => self
+                .manifest
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+        };
+        fix_unc_path(&res)
     }
 
-    pub fn get_packages(&self) -> Vec<Package> {
-        match *self.get_metadata() {
-            Some(ref meta) => meta.packages.clone(),
-            None => vec![],
-        }
+    pub fn manifest(&self) -> PathBuf {
+        fix_unc_path(&self.manifest)
+    }
+
+    pub fn set_manifest(&mut self, manifest: PathBuf) {
+        self.manifest = manifest;
     }
 
     pub fn output_dir(&self) -> PathBuf {
-        if let Some(ref path) = self.output_directory {
-            path.clone()
+        let path = if let Some(ref path) = self.output_directory {
+            if path.is_relative() {
+                self.root().join(path)
+            } else {
+                path.clone()
+            }
         } else {
-            env::current_dir().unwrap()
-        }
+            self.root()
+        };
+        fix_unc_path(&path)
     }
 
     pub fn get_config_vec(file_configs: std::io::Result<Vec<Self>>, backup: Self) -> ConfigWrapper {
@@ -503,10 +551,12 @@ impl Config {
 
     /// Taking an existing config look for any relevant config files
     pub fn check_for_configs(&self) -> Option<PathBuf> {
-        if let Some(root) = &self.root {
-            Self::check_path_for_configs(&root)
+        if let Some(config_file) = env::var_os("CARGO_TARPAULIN_CONFIG_FILE") {
+            Some(config_file.into())
+        } else if let Some(root) = &self.root {
+            Self::check_path_for_configs(root)
         } else if let Some(root) = self.manifest.clone().parent() {
-            Self::check_path_for_configs(&root)
+            Self::check_path_for_configs(root)
         } else {
             None
         }
@@ -527,16 +577,14 @@ impl Config {
     }
 
     pub fn load_config_file<P: AsRef<Path>>(file: P) -> std::io::Result<Vec<Self>> {
-        let mut f = File::open(file.as_ref())?;
-        let mut buffer = Vec::new();
-        f.read_to_end(&mut buffer)?;
+        let buffer = fs::read_to_string(file.as_ref())?;
         let mut res = Self::parse_config_toml(&buffer);
         let parent = match file.as_ref().parent() {
             Some(p) => p.to_path_buf(),
             None => PathBuf::new(),
         };
         if let Ok(cfs) = res.as_mut() {
-            for mut c in cfs.iter_mut() {
+            for c in cfs.iter_mut() {
                 c.config = Some(file.as_ref().to_path_buf());
                 c.manifest = make_absolute_with_parent(&c.manifest, &parent);
                 if let Some(root) = c.root.as_mut() {
@@ -553,14 +601,14 @@ impl Config {
         res
     }
 
-    pub fn parse_config_toml(buffer: &[u8]) -> std::io::Result<Vec<Self>> {
-        let mut map: IndexMap<String, Self> = toml::from_slice(buffer).map_err(|e| {
+    pub fn parse_config_toml(buffer: &str) -> std::io::Result<Vec<Self>> {
+        let mut map: IndexMap<String, Self> = toml::from_str(buffer).map_err(|e| {
             error!("Invalid config file {}", e);
-            Error::new(ErrorKind::InvalidData, format!("{}", e))
+            Error::new(ErrorKind::InvalidData, format!("{e}"))
         })?;
 
         let mut result = Vec::new();
-        for (name, mut conf) in map.iter_mut() {
+        for (name, conf) in map.iter_mut() {
             conf.name = name.to_string();
             result.push(conf.clone());
         }
@@ -587,26 +635,41 @@ impl Config {
         self.forward_signals |= other.forward_signals;
         self.run_ignored |= other.run_ignored;
         self.release |= other.release;
+        self.no_dead_code |= other.no_dead_code;
         self.count |= other.count;
         self.all_features |= other.all_features;
         self.implicit_test_threads |= other.implicit_test_threads;
-        self.all_targets |= other.all_targets;
         self.line_coverage |= other.line_coverage;
         self.branch_coverage |= other.branch_coverage;
         self.dump_traces |= other.dump_traces;
-        self.ignore_tests = self.ignore_tests() && other.ignore_tests();
         self.offline |= other.offline;
+        self.stderr |= other.stderr;
         if self.manifest != other.manifest && self.manifest == default_manifest() {
             self.manifest = other.manifest.clone();
         }
+        for obj in &other.objects {
+            if !self.objects.contains(obj) {
+                self.objects.push(obj.clone());
+            }
+        }
         self.root = Config::pick_optional_config(&self.root, &other.root);
         self.coveralls = Config::pick_optional_config(&self.coveralls, &other.coveralls);
-        self.ci_tool = Config::pick_optional_config(&self.ci_tool, &other.ci_tool);
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "coveralls")] {
+                self.ci_tool = Config::pick_optional_config(&self.ci_tool, &other.ci_tool);
+            }
+        }
+
         self.report_uri = Config::pick_optional_config(&self.report_uri, &other.report_uri);
         self.target = Config::pick_optional_config(&self.target, &other.target);
         self.target_dir = Config::pick_optional_config(&self.target_dir, &other.target_dir);
         self.output_directory =
             Config::pick_optional_config(&self.output_directory, &other.output_directory);
+        let other_engine = *other.engine.borrow();
+        if other_engine.is_some() {
+            self.engine.replace(other_engine);
+        }
         self.all |= other.all;
         self.frozen |= other.frozen;
         self.locked |= other.locked;
@@ -614,7 +677,7 @@ impl Config {
         // non-default
         self.force_clean &= other.force_clean;
         self.skip_clean |= other.skip_clean;
-        self.ignore_tests |= other.ignore_tests;
+        self.include_tests |= other.include_tests;
         self.no_fail_fast |= other.no_fail_fast;
 
         let end_delay = match (self.post_test_delay, other.post_test_delay) {
@@ -635,7 +698,7 @@ impl Config {
         }
 
         let new_flags = match (self.rustflags.as_ref(), other.rustflags.as_ref()) {
-            (Some(a), Some(b)) => Some(format!("{} {}", a, b)),
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
             (Some(a), None) => Some(a.clone()),
             (None, Some(b)) => Some(b.clone()),
             _ => None,
@@ -742,6 +805,15 @@ impl Config {
             let mut excluded_files = self.excluded_files.borrow_mut();
             excluded_files.clear();
         }
+
+        if !other.included_files_raw.is_empty() {
+            self.included_files_raw
+                .extend_from_slice(&other.included_files_raw);
+
+            // Now invalidated the compiled regex cache so clear it
+            let mut included_files = self.included_files.borrow_mut();
+            included_files.clear();
+        }
     }
 
     pub fn pick_optional_config<T: Clone>(
@@ -753,6 +825,10 @@ impl Config {
         } else {
             base_config.clone()
         }
+    }
+
+    pub fn objects(&self) -> &[PathBuf] {
+        &self.objects
     }
 
     pub fn has_named_tests(&self) -> bool {
@@ -771,7 +847,7 @@ impl Config {
     pub fn exclude_path(&self, path: &Path) -> bool {
         if self.excluded_files.borrow().len() != self.excluded_files_raw.len() {
             let mut excluded_files = self.excluded_files.borrow_mut();
-            let mut compiled = regexes_from_excluded(&self.excluded_files_raw);
+            let mut compiled = globs_from_excluded(&self.excluded_files_raw);
             excluded_files.clear();
             excluded_files.append(&mut compiled);
         }
@@ -780,27 +856,47 @@ impl Config {
         self.excluded_files
             .borrow()
             .iter()
-            .any(|x| x.is_match(project.to_str().unwrap_or("")))
+            .any(|x| x.matches_path(&project))
+    }
+
+    #[inline]
+    pub fn include_path(&self, path: &Path) -> bool {
+        if self.included_files.borrow().len() != self.included_files_raw.len() {
+            let mut included_files = self.included_files.borrow_mut();
+            let mut compiled = globs_from_excluded(&self.included_files_raw);
+            included_files.clear();
+            included_files.append(&mut compiled);
+        }
+
+        let project = self.strip_base_dir(path);
+
+        //if empty, then parameter not used, thus all files are included by default
+        if self.included_files.borrow().is_empty() {
+            return true;
+        }
+
+        self.included_files
+            .borrow()
+            .iter()
+            .any(|x| x.matches_path(&project))
     }
 
     /// returns the relative path from the base_dir
     /// uses root if set, else env::current_dir()
     #[inline]
     pub fn get_base_dir(&self) -> PathBuf {
-        if let Some(root) = &self.root {
-            if Path::new(root).is_absolute() {
-                PathBuf::from(root)
-            } else {
-                let base_dir = env::current_dir().unwrap();
-                if let Ok(res) = base_dir.join(root).canonicalize() {
-                    res
-                } else {
-                    base_dir
-                }
-            }
+        let root = self.root();
+        let res = if root.is_absolute() {
+            root
         } else {
-            env::current_dir().unwrap()
-        }
+            let base_dir = env::current_dir().unwrap();
+            if let Ok(res) = base_dir.join(root).canonicalize() {
+                res
+            } else {
+                base_dir
+            }
+        };
+        fix_unc_path(&res)
     }
 
     /// returns the relative path from the base_dir
@@ -852,8 +948,8 @@ pub fn path_relative_from(path: &Path, base: &Path) -> Option<PathBuf> {
                 }
                 (None, _) => comps.push(Component::ParentDir),
                 (Some(a), Some(b)) if comps.is_empty() && a == b => (),
-                (Some(a), Some(b)) if b == Component::CurDir => comps.push(a),
-                (Some(_), Some(b)) if b == Component::ParentDir => return None,
+                (Some(a), Some(Component::CurDir)) => comps.push(a),
+                (Some(_), Some(Component::ParentDir)) => return None,
                 (Some(a), Some(_)) => {
                     comps.push(Component::ParentDir);
                     for _ in itb {
@@ -871,48 +967,44 @@ pub fn path_relative_from(path: &Path, base: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    use crate::args::TarpaulinCli;
+
     use super::*;
-    use clap::App;
+
+    #[test]
+    fn is_root_absolute() {
+        let args = TarpaulinCli::parse_from(vec!["tarpaulin", "-r", "."]);
+        let conf = ConfigWrapper::from(args.config).0;
+        assert!(conf[0].root().is_absolute());
+    }
 
     #[test]
     fn features_args() {
-        let matches = App::new("tarpaulin")
-            .args_from_usage(
-                "--features [FEATURES]... 'Features to be included in the target project'
-                             --ignore-config 'Ignore any project config files'",
-            )
-            .get_matches_from_safe(vec![
-                "tarpaulin",
-                "--ignore-config",
-                "--features",
-                "a",
-                "--features",
-                "b",
-            ])
-            .unwrap();
-        let conf = ConfigWrapper::from(&matches).0;
+        let args = TarpaulinCli::parse_from(vec![
+            "tarpaulin",
+            "--ignore-config",
+            "--features",
+            "a",
+            "--features",
+            "b",
+        ]);
+        let conf = ConfigWrapper::from(args.config).0;
         assert_eq!(conf.len(), 1);
         assert_eq!(conf[0].features, Some("a b".to_string()));
 
-        let matches = App::new("tarpaulin")
-            .args_from_usage(
-                "--features [FEATURES]... 'Features to be included in the target project'
-                             --ignore-config 'Ignore any project config files'",
-            )
-            .get_matches_from_safe(vec!["tarpaulin", "--ignore-config", "--features", "a b"])
-            .unwrap();
-        let conf = ConfigWrapper::from(&matches).0;
+        let args =
+            TarpaulinCli::parse_from(vec!["tarpaulin", "--ignore-config", "--features", "a b"]);
+        let conf = ConfigWrapper::from(args.config).0;
         assert_eq!(conf.len(), 1);
         assert_eq!(conf[0].features, Some("a b".to_string()));
     }
 
     #[test]
     fn exclude_paths() {
-        let matches = App::new("tarpaulin")
-            .args_from_usage("--exclude-files [FILE]... 'Exclude given files from coverage results has * wildcard'")
-            .get_matches_from_safe(vec!["tarpaulin", "--exclude-files", "*module*"])
-            .unwrap();
-        let conf = ConfigWrapper::from(&matches).0;
+        let args = TarpaulinCli::parse_from(vec!["tarpaulin", "--exclude-files", "*module*"]);
+        let conf = ConfigWrapper::from(args.config).0;
         assert_eq!(conf.len(), 1);
         assert!(conf[0].exclude_path(Path::new("src/module/file.rs")));
         assert!(!conf[0].exclude_path(Path::new("src/mod.rs")));
@@ -921,31 +1013,89 @@ mod tests {
     }
 
     #[test]
+    fn exclude_paths_directory_separators() {
+        let args = TarpaulinCli::parse_from(vec![
+            "tarpaulin",
+            "--exclude-files",
+            "src/foo/*",
+            "src\\bar\\*",
+        ]);
+        let conf = ConfigWrapper::from(args.config).0;
+        assert_eq!(conf.len(), 1);
+        assert!(conf[0].exclude_path(Path::new("src/foo/file.rs")));
+        assert!(conf[0].exclude_path(Path::new("src\\bar\\file.rs")));
+
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                assert!(conf[0].exclude_path(Path::new("src\\foo\\file.rs")));
+                assert!(conf[0].exclude_path(Path::new("src/bar/file.rs")));
+            } else {
+                assert!(!conf[0].exclude_path(Path::new("src\\foo\\file.rs")));
+                assert!(!conf[0].exclude_path(Path::new("src/bar/file.rs")));
+            }
+        }
+    }
+
+    #[test]
+    fn include_paths_directory_separators() {
+        let args = TarpaulinCli::parse_from(vec![
+            "tarpaulin",
+            "--include-files",
+            "src/foo/*",
+            "src\\bar\\*",
+        ]);
+        let conf = ConfigWrapper::from(args.config).0;
+        assert_eq!(conf.len(), 1);
+        assert!(conf[0].include_path(Path::new("src/foo/file.rs")));
+        assert!(conf[0].include_path(Path::new("src\\bar\\file.rs")));
+
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                assert!(conf[0].include_path(Path::new("src\\foo\\file.rs")));
+                assert!(conf[0].include_path(Path::new("src/bar/file.rs")));
+            } else {
+                assert!(!conf[0].include_path(Path::new("src\\foo\\file.rs")));
+                assert!(!conf[0].include_path(Path::new("src/bar/file.rs")));
+            }
+        }
+    }
+
+    #[test]
     fn no_exclusions() {
-        let matches = App::new("tarpaulin")
-            .args_from_usage("--exclude-files [FILE]... 'Exclude given files from coverage results has * wildcard'")
-            .get_matches_from_safe(vec!["tarpaulin"])
-            .unwrap();
-        let conf = ConfigWrapper::from(&matches).0;
+        let args = TarpaulinCli::parse_from(vec!["tarpaulin"]);
+        let conf = ConfigWrapper::from(args.config).0;
         assert_eq!(conf.len(), 1);
         assert!(!conf[0].exclude_path(Path::new("src/module/file.rs")));
         assert!(!conf[0].exclude_path(Path::new("src/mod.rs")));
         assert!(!conf[0].exclude_path(Path::new("unrelated.rs")));
         assert!(!conf[0].exclude_path(Path::new("module.rs")));
+
+        assert!(conf[0].include_path(Path::new("src/module/file.rs")));
+        assert!(conf[0].include_path(Path::new("src/mod.rs")));
+        assert!(conf[0].include_path(Path::new("unrelated.rs")));
+        assert!(conf[0].include_path(Path::new("module.rs")));
     }
 
     #[test]
     fn exclude_exact_file() {
-        let matches = App::new("tarpaulin")
-            .args_from_usage("--exclude-files [FILE]... 'Exclude given files from coverage results has * wildcard'")
-            .get_matches_from_safe(vec!["tarpaulin", "--exclude-files", "*/lib.rs"])
-            .unwrap();
-        let conf = ConfigWrapper::from(&matches).0;
+        let args = TarpaulinCli::parse_from(vec!["tarpaulin", "--exclude-files", "*/lib.rs"]);
+        let conf = ConfigWrapper::from(args.config).0;
         assert_eq!(conf.len(), 1);
         assert!(conf[0].exclude_path(Path::new("src/lib.rs")));
         assert!(!conf[0].exclude_path(Path::new("src/mod.rs")));
         assert!(!conf[0].exclude_path(Path::new("src/notlib.rs")));
         assert!(!conf[0].exclude_path(Path::new("lib.rs")));
+    }
+
+    #[test]
+    fn include_exact_file() {
+        let args = TarpaulinCli::parse_from(vec!["tarpaulin", "--include-files", "*/lib.rs"]);
+        let conf = ConfigWrapper::from(args.config).0;
+        assert_eq!(conf.len(), 1);
+        assert!(conf[0].include_path(Path::new("src/lib.rs")));
+        assert!(!conf[0].include_path(Path::new("src/mod.rs")));
+        assert!(!conf[0].include_path(Path::new("src/notlib.rs")));
+        assert!(!conf[0].include_path(Path::new("lib.rs")));
     }
 
     #[test]
@@ -957,8 +1107,8 @@ mod tests {
                 let root_base = "";
             }
         }
-        let path_a = PathBuf::from(format!("{}/this/should/form/a/rel/path/", root_base));
-        let path_b = PathBuf::from(format!("{}/this/should/form/b/rel/path/", root_base));
+        let path_a = PathBuf::from(format!("{root_base}/this/should/form/a/rel/path/"));
+        let path_b = PathBuf::from(format!("{root_base}/this/should/form/b/rel/path/"));
 
         let rel_path = path_relative_from(&path_b, &path_a);
         assert!(rel_path.is_some());
@@ -968,7 +1118,7 @@ mod tests {
             "Wrong relative path"
         );
 
-        let path_a = PathBuf::from(format!("{}/this/should/not/form/a/rel/path/", root_base));
+        let path_a = PathBuf::from(format!("{root_base}/this/should/not/form/a/rel/path/"));
         let path_b = Path::new("this/should/not/form/a/rel/path/");
         assert!(!path_b.is_absolute());
         assert!(path_a.is_absolute());
@@ -996,7 +1146,7 @@ mod tests {
         [other]
         run-types = [\"Doctests\", \"Tests\"]";
 
-        let configs = Config::parse_config_toml(toml.as_bytes()).unwrap();
+        let configs = Config::parse_config_toml(toml).unwrap();
         assert_eq!(configs.len(), 2);
         for c in &configs {
             if c.name == "global" {
@@ -1018,7 +1168,7 @@ mod tests {
         exclude-files = ["foo.rs"]
         "#;
 
-        let mut configs = Config::parse_config_toml(toml.as_bytes()).unwrap();
+        let mut configs = Config::parse_config_toml(toml).unwrap();
         let mut config = configs.remove(0);
         config.merge(&configs[0]);
         assert!(config.excluded_files_raw.contains(&"target/*".to_string()));
@@ -1034,9 +1184,9 @@ mod tests {
         let toml_b = r#"target = "wasm32-unknown-unknown""#;
         let toml_c = r#"target = "x86_64-linux-gnu""#;
 
-        let mut a: Config = toml::from_slice(toml_a.as_bytes()).unwrap();
-        let mut b: Config = toml::from_slice(toml_b.as_bytes()).unwrap();
-        let c: Config = toml::from_slice(toml_c.as_bytes()).unwrap();
+        let mut a: Config = toml::from_str(toml_a).unwrap();
+        let mut b: Config = toml::from_str(toml_b).unwrap();
+        let c: Config = toml::from_str(toml_c).unwrap();
 
         assert_eq!(a.target, None);
         assert_eq!(b.target, Some(String::from("wasm32-unknown-unknown")));
@@ -1054,8 +1204,8 @@ mod tests {
         let toml_a = r#"workspace = false"#;
         let toml_b = r#"workspace = true"#;
 
-        let mut a: Config = toml::from_slice(toml_a.as_bytes()).unwrap();
-        let b: Config = toml::from_slice(toml_b.as_bytes()).unwrap();
+        let mut a: Config = toml::from_str(toml_a).unwrap();
+        let b: Config = toml::from_str(toml_b).unwrap();
 
         assert!(!a.all);
         assert!(b.all);
@@ -1065,14 +1215,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_engine_overrides_config_merge() {
+        let mut config_file: Config = toml::from_str(r#"engine = "Ptrace""#).unwrap();
+        let cli = Config {
+            engine: RefCell::new(Some(TraceEngine::Llvm)),
+            ..Config::default()
+        };
+
+        config_file.merge(&cli);
+
+        assert_eq!(*config_file.engine.borrow(), Some(TraceEngine::Llvm));
+    }
+
+    #[test]
+    fn absent_engine_does_not_override_config_merge() {
+        let mut config_file: Config = toml::from_str(r#"engine = "Llvm""#).unwrap();
+        let cli = Config::default();
+
+        config_file.merge(&cli);
+
+        assert_eq!(*config_file.engine.borrow(), Some(TraceEngine::Llvm));
+    }
+
+    #[test]
     fn packages_merge() {
         let toml_a = r#"packages = []"#;
         let toml_b = r#"packages = ["a"]"#;
         let toml_c = r#"packages = ["b", "a"]"#;
 
-        let mut a: Config = toml::from_slice(toml_a.as_bytes()).unwrap();
-        let mut b: Config = toml::from_slice(toml_b.as_bytes()).unwrap();
-        let c: Config = toml::from_slice(toml_c.as_bytes()).unwrap();
+        let mut a: Config = toml::from_str(toml_a).unwrap();
+        let mut b: Config = toml::from_str(toml_b).unwrap();
+        let c: Config = toml::from_str(toml_c).unwrap();
 
         assert_eq!(a.packages, Vec::<String>::new());
         assert_eq!(b.packages, vec![String::from("a")]);
@@ -1094,9 +1267,9 @@ mod tests {
         let toml_c = r#"packages = ["b", "a"]
                         exclude = ["c"]"#;
 
-        let mut a: Config = toml::from_slice(toml_a.as_bytes()).unwrap();
-        let mut b: Config = toml::from_slice(toml_b.as_bytes()).unwrap();
-        let c: Config = toml::from_slice(toml_c.as_bytes()).unwrap();
+        let mut a: Config = toml::from_str(toml_a).unwrap();
+        let mut b: Config = toml::from_str(toml_b).unwrap();
+        let c: Config = toml::from_str(toml_c).unwrap();
 
         assert_eq!(a.exclude, vec![String::from("a")]);
         assert_eq!(b.exclude, vec![String::from("b")]);
@@ -1111,6 +1284,7 @@ mod tests {
         assert_eq!(b.exclude, vec![String::from("b"), String::from("c")]);
     }
 
+    #[cfg(feature = "coveralls")]
     #[test]
     fn coveralls_merge() {
         let toml = r#"[a]
@@ -1122,7 +1296,7 @@ mod tests {
         ciserver = "coveralls-ruby"
         "#;
 
-        let configs = Config::parse_config_toml(toml.as_bytes()).unwrap();
+        let configs = Config::parse_config_toml(toml).unwrap();
         let mut a_config = configs.iter().find(|x| x.name == "a").unwrap().clone();
         let b_config = configs.iter().find(|x| x.name == "b").unwrap();
         a_config.merge(b_config);
@@ -1139,17 +1313,35 @@ mod tests {
 
     #[test]
     fn output_dir_merge() {
-        let toml = r#"[has_dir]
-        output-dir = "foo"
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                let toml = r#"[has_dir]
+                output-dir = "C:/foo"
 
-        [no_dir]
-        coveralls = "xyz"
-        
-        [other_dir]
-        output-dir = "bar"
-        "#;
+                [no_dir]
+                coveralls = "xyz"
 
-        let configs = Config::parse_config_toml(toml.as_bytes()).unwrap();
+                [other_dir]
+                output-dir = "C:/bar"
+                "#;
+                let foo_dir = PathBuf::from("C:/foo");
+                let bar_dir = PathBuf::from("C:/bar");
+            } else {
+                let toml = r#"[has_dir]
+                output-dir = "/foo"
+
+                [no_dir]
+                coveralls = "xyz"
+
+                [other_dir]
+                output-dir = "/bar"
+                "#;
+                let foo_dir = PathBuf::from("/foo");
+                let bar_dir = PathBuf::from("/bar");
+            }
+        }
+
+        let configs = Config::parse_config_toml(toml).unwrap();
         let has_dir = configs
             .iter()
             .find(|x| x.name == "has_dir")
@@ -1164,19 +1356,19 @@ mod tests {
 
         let mut merged_into_has_dir = has_dir.clone();
         merged_into_has_dir.merge(&no_dir);
-        assert_eq!(merged_into_has_dir.output_dir(), PathBuf::from("foo"));
+        assert_eq!(merged_into_has_dir.output_dir(), foo_dir);
 
         let mut merged_into_no_dir = no_dir.clone();
         merged_into_no_dir.merge(&has_dir);
-        assert_eq!(merged_into_no_dir.output_dir(), PathBuf::from("foo"));
+        assert_eq!(merged_into_no_dir.output_dir(), foo_dir);
 
         let mut neither_merged_dir = no_dir.clone();
         neither_merged_dir.merge(&no_dir);
-        assert_eq!(neither_merged_dir.output_dir(), env::current_dir().unwrap());
+        assert_eq!(neither_merged_dir.output_dir(), env::current_dir().unwrap(),);
 
         let mut both_merged_dir = has_dir;
         both_merged_dir.merge(&other_dir);
-        assert_eq!(both_merged_dir.output_dir(), PathBuf::from("bar"));
+        assert_eq!(both_merged_dir.output_dir(), bar_dir);
     }
 
     #[test]
@@ -1184,12 +1376,12 @@ mod tests {
         let toml = r#"
         [flag1]
         rustflags = "xyz"
-        
+
         [flag2]
         rustflags = "bar"
         "#;
 
-        let configs = Config::parse_config_toml(toml.as_bytes()).unwrap();
+        let configs = Config::parse_config_toml(toml).unwrap();
         let flag1 = configs.iter().find(|x| x.name == "flag1").unwrap().clone();
         let flag2 = configs.iter().find(|x| x.name == "flag2").unwrap().clone();
         let noflags = Config::default();
@@ -1255,13 +1447,12 @@ mod tests {
         dump-traces = true
         all-targets = true
         "#;
-        let mut configs = Config::parse_config_toml(toml.as_bytes()).unwrap();
+        let mut configs = Config::parse_config_toml(toml).unwrap();
         assert_eq!(configs.len(), 1);
         let config = configs.remove(0);
         assert!(config.debug);
         assert!(config.verbose);
         assert!(config.dump_traces);
-        assert!(config.all_targets);
         assert!(config.ignore_panics);
         assert!(config.count);
         assert!(config.run_ignored);

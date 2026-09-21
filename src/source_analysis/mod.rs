@@ -1,19 +1,19 @@
-use crate::branching::BranchAnalysis;
 use crate::config::{Config, RunType};
 use crate::path_utils::{get_source_walker, is_source_file};
-use lazy_static::lazy_static;
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use syn::spanned::Spanned;
 use syn::*;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
 mod attributes;
@@ -44,7 +44,7 @@ pub enum Lines {
 #[derive(Clone, Debug, Default)]
 pub struct LineAnalysis {
     /// This represents lines that should be ignored in coverage
-    /// but may be identifed as coverable in the DWARF tables
+    /// but may be identified as coverable in the DWARF tables
     pub ignore: HashSet<Lines>,
     /// This represents lines that should be included in coverage
     /// But may be ignored. Doesn't make sense to cover ALL the lines so this
@@ -56,6 +56,49 @@ pub struct LineAnalysis {
     pub logical_lines: HashMap<usize, usize>,
     /// Shows the line length of the provided file
     max_line: usize,
+    pub functions: HashMap<String, (usize, usize)>,
+}
+
+/// Provides context to the source analysis stage including the tarpaulin
+/// config and the source code being analysed.
+pub(crate) struct Context<'a> {
+    /// Program config
+    config: &'a Config,
+    /// Contents of the source file
+    file_contents: &'a str,
+    /// path to the file being analysed
+    file: &'a Path,
+    /// Other parts of context are immutable like tarpaulin config and users
+    /// source code. This is discovered during hence use of interior mutability
+    ignore_mods: RefCell<HashSet<PathBuf>>,
+    /// As we traverse the structures we want to grab module names etc so we can get proper names
+    /// for our functions etc
+    pub(crate) symbol_stack: RefCell<Vec<String>>,
+}
+
+pub(crate) struct StackGuard<'a>(&'a RefCell<Vec<String>>);
+
+impl<'a> Drop for StackGuard<'a> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().pop();
+    }
+}
+
+impl<'a> Context<'a> {
+    pub(crate) fn push_to_symbol_stack(&self, mut ident: String) -> StackGuard<'_> {
+        if !(ident.starts_with("<") && ident.ends_with(">")) {
+            ident = ident.replace(' ', "");
+        }
+        self.symbol_stack.borrow_mut().push(ident);
+        StackGuard(&self.symbol_stack)
+    }
+
+    pub(crate) fn get_qualified_name(&self) -> String {
+        let stack = self.symbol_stack.borrow();
+        let name = stack.join("::");
+        debug!("Found function: {}", name);
+        name
+    }
 }
 
 /// When the `LineAnalysis` results are mapped to their files there needs to be
@@ -191,9 +234,7 @@ impl LineAnalysis {
         // for a reason.
         let mut useful_lines: HashSet<usize> = HashSet::new();
         if let Some(c) = contents {
-            lazy_static! {
-                static ref SINGLE_LINE: Regex = Regex::new(r"\s*//").unwrap();
-            }
+            static SINGLE_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*//").unwrap());
             const MULTI_START: &str = "/*";
             const MULTI_END: &str = "*/";
             let len = span.end().line - span.start().line;
@@ -231,6 +272,12 @@ impl LineAnalysis {
             || (self.max_line > 0 && self.max_line < line)
     }
 
+    /// Returns true iff `line` is in the force-cover set populated by
+    /// `cover_span` (generic, `#[inline]`, or generic impl method bodies).
+    pub fn is_force_covered(&self, line: usize) -> bool {
+        self.cover.contains(&line)
+    }
+
     /// Adds a line to the list of lines to ignore
     fn add_to_ignore(&mut self, lines: impl IntoIterator<Item = usize>) {
         if !self.ignore.contains(&Lines::All) {
@@ -244,10 +291,26 @@ impl LineAnalysis {
     }
 }
 
+impl Function {
+    fn new(name: &str, span: (usize, usize)) -> Self {
+        Self {
+            name: name.to_string(),
+            start: span.0 as u64,
+            end: span.1 as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+pub struct Function {
+    pub name: String,
+    pub start: u64,
+    pub end: u64,
+}
+
 #[derive(Default)]
 pub struct SourceAnalysis {
     pub lines: HashMap<PathBuf, LineAnalysis>,
-    pub branches: HashMap<PathBuf, BranchAnalysis>,
     ignored_modules: Vec<PathBuf>,
 }
 
@@ -256,20 +319,29 @@ impl SourceAnalysis {
         Default::default()
     }
 
+    pub fn create_function_map(&self) -> HashMap<PathBuf, Vec<Function>> {
+        self.lines
+            .iter()
+            .map(|(file, analysis)| {
+                let mut functions: Vec<Function> = analysis
+                    .functions
+                    .iter()
+                    .map(|(function, span)| Function::new(function, *span))
+                    .collect();
+                functions.sort_unstable_by(|a, b| a.start.cmp(&b.start));
+                (file.to_path_buf(), functions)
+            })
+            .collect()
+    }
+
     pub fn get_line_analysis(&mut self, path: PathBuf) -> &mut LineAnalysis {
         self.lines
             .entry(path.clone())
             .or_insert_with(|| LineAnalysis::new_from_file(&path).unwrap_or_default())
     }
 
-    pub fn get_branch_analysis(&mut self, path: PathBuf) -> &mut BranchAnalysis {
-        self.branches
-            .entry(path)
-            .or_insert_with(BranchAnalysis::new)
-    }
-
     fn is_ignored_module(&self, path: &Path) -> bool {
-        self.ignored_modules.iter().any(|x| path.starts_with(&x))
+        self.ignored_modules.iter().any(|x| path.starts_with(x))
     }
 
     pub fn get_analysis(config: &Config) -> Self {
@@ -292,7 +364,6 @@ impl SourceAnalysis {
             analysis.ignore_all();
             result.lines.insert(e.clone(), analysis);
         }
-
         result.debug_printout(config);
 
         result
@@ -307,10 +378,9 @@ impl SourceAnalysis {
         filtered_files: &mut HashSet<PathBuf>,
     ) {
         if let Some(file) = path.to_str() {
-            let skip_cause_test = config.ignore_tests() && path.starts_with(root.join("tests"));
             let skip_cause_example = path.starts_with(root.join("examples"))
                 && !config.run_types.contains(&RunType::Examples);
-            if (skip_cause_test || skip_cause_example) || self.is_ignored_module(path) {
+            if skip_cause_example || self.is_ignored_module(path) {
                 let mut analysis = LineAnalysis::new();
                 analysis.ignore_all();
                 self.lines.insert(path.to_path_buf(), analysis);
@@ -333,6 +403,7 @@ impl SourceAnalysis {
                             file_contents: &content,
                             file: path,
                             ignore_mods: RefCell::new(HashSet::new()),
+                            symbol_stack: RefCell::new(vec![]),
                         };
                         if self.check_attr_list(&file.attrs, &ctx) {
                             self.find_ignorable_lines(&ctx);
@@ -391,13 +462,11 @@ impl SourceAnalysis {
     }
 
     /// Finds lines from the raw string which are ignorable.
-    /// These are often things like close braces, semi colons that may regiser as
+    /// These are often things like close braces, semicolons that may register as
     /// false positives.
-    fn find_ignorable_lines(&mut self, ctx: &Context) {
-        lazy_static! {
-            static ref IGNORABLE: Regex =
-                Regex::new(r"^((\s*///)|([\[\]\{\}\(\)\s;\?,/]*$))").unwrap();
-        }
+    pub(crate) fn find_ignorable_lines(&mut self, ctx: &Context) {
+        static IGNORABLE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^((\s*//)|([\[\]\{\}\(\)\s;\?,/]*$))").unwrap());
         let analysis = self.get_line_analysis(ctx.file.to_path_buf());
         let lines = ctx
             .file_contents
@@ -429,6 +498,7 @@ impl SourceAnalysis {
 
     /// Printout a debug summary of the results of source analysis if debug logging
     /// is enabled
+    #[cfg(not(tarpaulin_include))]
     pub fn debug_printout(&self, config: &Config) {
         if config.debug {
             for (path, analysis) in &self.lines {
@@ -463,10 +533,6 @@ impl SourceAnalysis {
                     trace!("Coverable lines: {:?}", lines);
                 }
             }
-            if config.branch_coverage {
-                trace!("Branch analysis");
-                trace!("{:?}", self.branches);
-            }
         }
     }
 }
@@ -485,18 +551,4 @@ fn maybe_ignore_first_line(file: &Path, result: &mut HashMap<PathBuf, LineAnalys
             }
         }
     }
-}
-
-/// Provides context to the source analysis stage including the tarpaulin
-/// config and the source code being analysed.
-pub(crate) struct Context<'a> {
-    /// Program config
-    config: &'a Config,
-    /// Contents of the source file
-    file_contents: &'a str,
-    /// path to the file being analysed
-    file: &'a Path,
-    /// Other parts of context are immutable like tarpaulin config and users
-    /// source code. This is discovered during hence use of interior mutability
-    ignore_mods: RefCell<HashSet<PathBuf>>,
 }

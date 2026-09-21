@@ -1,7 +1,8 @@
+use crate::cargo::{CargoConfigFields, LD_PATH_VAR, rust_flags};
 use crate::config::Color;
 use crate::generate_tracemap;
 use crate::path_utils::get_profile_walker;
-use crate::statemachine::{create_state_machine, TestState};
+use crate::statemachine::{TestState, create_state_machine};
 use crate::traces::*;
 use crate::{Config, EventLog, LineAnalysis, RunError, TestBinary, TraceEngine};
 use std::collections::HashMap;
@@ -9,7 +10,27 @@ use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::rc::Rc;
 use tracing::{debug, error, info, trace_span};
+
+cfg_if::cfg_if! {
+    if #[cfg(ptrace_supported)] {
+        pub mod linux;
+        pub use linux::*;
+
+        pub mod breakpoint;
+        pub mod ptrace_control;
+
+        pub mod event_source;
+
+        #[cfg(test)]
+        pub mod mock_event_source;
+
+        pub type ProcessHandle = nix::unistd::Pid;
+    } else {
+        pub type ProcessHandle = u64;
+    }
+}
 
 /// Handle to a test currently either PID or a `std::process::Child`
 pub enum TestHandle {
@@ -17,6 +38,7 @@ pub enum TestHandle {
     Process(RunningProcessHandle),
 }
 
+#[derive(Debug)]
 pub struct RunningProcessHandle {
     /// Used to map coverage counters to line numbers
     pub(crate) path: PathBuf,
@@ -55,7 +77,7 @@ impl RunningProcessHandle {
 impl fmt::Display for TestHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TestHandle::Id(id) => write!(f, "{}", id),
+            TestHandle::Id(id) => write!(f, "{id}"),
             TestHandle::Process(c) => write!(f, "{}", c.child.id()),
         }
     }
@@ -78,10 +100,11 @@ pub fn get_test_coverage(
     other_binaries: &[PathBuf],
     analysis: &HashMap<PathBuf, LineAnalysis>,
     config: &Config,
+    cargo_config: Rc<CargoConfigFields>,
     ignored: bool,
     logger: &Option<EventLog>,
 ) -> Result<Option<(TraceMap, i32)>, RunError> {
-    let handle = launch_test(test, other_binaries, config, ignored, logger)?;
+    let handle = launch_test(test, other_binaries, config, cargo_config, ignored, logger)?;
     if let Some(handle) = handle {
         let t = collect_coverage(test.path(), handle, analysis, config, logger)?;
         Ok(Some(t))
@@ -94,6 +117,7 @@ fn launch_test(
     test: &TestBinary,
     other_binaries: &[PathBuf],
     config: &Config,
+    cargo_config: Rc<CargoConfigFields>,
     ignored: bool,
     logger: &Option<EventLog>,
 ) -> Result<Option<TestHandle>, RunError> {
@@ -104,7 +128,7 @@ fn launch_test(
         TraceEngine::Ptrace => {
             cfg_if::cfg_if! {
                 if #[cfg(ptrace_supported)] {
-                    linux::get_test_coverage(test, config, ignored)
+                    linux::get_test_coverage(test, config, cargo_config, ignored)
                 } else {
                     error!("Ptrace is not supported on this platform");
                     Err(RunError::TestCoverage("Unsupported OS".to_string()))
@@ -112,7 +136,8 @@ fn launch_test(
             }
         }
         TraceEngine::Llvm => {
-            let res = execute_test(test, other_binaries, ignored, config, None)?;
+            // 1 test thread because https://github.com/rust-lang/rust/issues/91092
+            let res = execute_test(test, other_binaries, ignored, config, cargo_config, Some(1))?;
             Ok(Some(res))
         }
         e => {
@@ -122,20 +147,6 @@ fn launch_test(
             );
             Err(RunError::TestCoverage("Unsupported OS".to_string()))
         }
-    }
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(ptrace_supported)] {
-        pub mod linux;
-        pub use linux::*;
-
-        pub mod breakpoint;
-        pub mod ptrace_control;
-
-        pub type ProcessHandle = nix::unistd::Pid;
-    } else {
-        pub type ProcessHandle = u64;
     }
 }
 
@@ -173,36 +184,65 @@ pub(crate) fn collect_coverage(
     Ok((traces, ret_code))
 }
 
-fn get_env_vars(test: &TestBinary, config: &Config) -> Vec<(String, String)> {
-    let mut envars: Vec<(String, String)> = Vec::new();
+fn get_env_vars(
+    test: &TestBinary,
+    config: &Config,
+    cargo_config: &CargoConfigFields,
+) -> HashMap<String, String> {
+    let mut envars = HashMap::default();
+
+    for (key, value) in cargo_config.env_vars.iter() {
+        envars.insert(key.to_string(), value.to_string());
+    }
 
     for (key, value) in env::vars() {
         // Avoid adding it twice
-        if key == "LD_LIBRARY_PATH" && test.has_linker_paths() {
+        if key == LD_PATH_VAR && test.has_linker_paths() || key == "RUSTFLAGS" {
             continue;
         }
-        envars.push((key.to_string(), value.to_string()));
+        envars.insert(key.to_string(), value.to_string());
     }
-    if config.verbose {
-        envars.push(("RUST_BACKTRACE".to_string(), "1".to_string()));
+    if config.verbose && !envars.contains_key("RUST_BACKTRACE") {
+        envars.insert("RUST_BACKTRACE".to_string(), "1".to_string());
     }
     if let Some(s) = test.pkg_name() {
-        envars.push(("CARGO_PKG_NAME".to_string(), s.to_string()));
+        envars.insert("CARGO_PKG_NAME".to_string(), s.to_string());
     }
     if let Some(s) = test.pkg_version() {
-        envars.push(("CARGO_PKG_VERSION".to_string(), s.to_string()));
+        envars.insert("CARGO_PKG_VERSION".to_string(), s.to_string());
     }
     if let Some(s) = test.pkg_authors() {
-        envars.push(("CARGO_PKG_AUTHORS".to_string(), s.join(":")));
+        envars.insert("CARGO_PKG_AUTHORS".to_string(), s.join(":"));
     }
     if let Some(s) = test.manifest_dir() {
-        envars.push(("CARGO_MANIFEST_DIR".to_string(), s.display().to_string()));
+        envars.insert("CARGO_MANIFEST_DIR".to_string(), s.display().to_string());
+    }
+    for (name, path) in &test.cargo_bin_exe_paths {
+        envars.insert(format!("CARGO_BIN_EXE_{name}"), path.display().to_string());
     }
     if test.has_linker_paths() {
-        envars.push(("LD_LIBRARY_PATH".to_string(), test.ld_library_path()));
+        envars.insert(LD_PATH_VAR.to_string(), test.ld_library_path());
     }
+    envars.insert("RUSTFLAGS".to_string(), rust_flags(config, cargo_config));
 
     envars
+}
+
+fn llvm_test_command(
+    test_path: &Path,
+    cargo_config: &CargoConfigFields,
+    argv: &[String],
+) -> Command {
+    let mut cmd = match cargo_config.target_runner.as_ref() {
+        Some(runner) => {
+            let mut cmd = Command::new(&runner.path);
+            cmd.args(&runner.args).arg(test_path);
+            cmd
+        }
+        None => Command::new(test_path),
+    };
+    cmd.args(argv);
+    cmd
 }
 
 /// Launches the test executable
@@ -211,17 +251,20 @@ fn execute_test(
     other_binaries: &[PathBuf],
     ignored: bool,
     config: &Config,
+    cargo_config: Rc<CargoConfigFields>,
     num_threads: Option<usize>,
 ) -> Result<TestHandle, RunError> {
     info!("running {}", test.path().display());
     let _ = match test.manifest_dir() {
-        Some(md) => env::set_current_dir(&md),
-        None => env::set_current_dir(&config.root()),
+        Some(md) => env::set_current_dir(md),
+        None => env::set_current_dir(config.root()),
     };
 
     debug!("Current working dir: {:?}", env::current_dir());
 
-    let mut envars = get_env_vars(test, config);
+    let mut envars = get_env_vars(test, config, &cargo_config)
+        .drain()
+        .collect::<Vec<(String, String)>>();
 
     let mut argv = vec![];
     if ignored {
@@ -232,21 +275,16 @@ fn execute_test(
         argv.push("--color".to_string());
         argv.push(config.color.to_string().to_ascii_lowercase());
     }
-    let no_test_env = if let Ok(threads) = env::var("RUST_TEST_THREADS") {
+    if let Ok(threads) = env::var("RUST_TEST_THREADS") {
         envars.push(("RUST_TEST_THREADS".to_string(), threads));
-        false
-    } else {
-        true
-    };
-
-    if no_test_env
-        && test.is_test_type()
+    } else if let Some(tt) = cargo_config.env_vars.get("RUST_TEST_THREADS") {
+        envars.push(("RUST_TEST_THREADS".to_string(), tt.clone()));
+    } else if test.is_test_type()
         && !config.implicit_test_threads
         && !config.varargs.iter().any(|x| x.contains("--test-threads"))
     {
         if let Some(threads) = num_threads {
-            argv.push("--test-threads".to_string());
-            argv.push(threads.to_string());
+            envars.push(("RUST_TEST_THREADS".to_string(), threads.to_string()));
         }
     }
 
@@ -255,15 +293,18 @@ fn execute_test(
             info!("Setting LLVM_PROFILE_FILE");
             // Used for llvm coverage to avoid report naming clashes TODO could have clashes
             // between runs
+            let profile_dir = config
+                .profraw_dir()
+                .join(format!("{}_%m-%p.profraw", test.file_name()));
             envars.push((
                 "LLVM_PROFILE_FILE".to_string(),
-                format!("{}_%m-%p.profraw", test.file_name()),
+                profile_dir.display().to_string(),
             ));
             debug!("Env vars: {:?}", envars);
             debug!("Args: {:?}", argv);
-            let mut child = Command::new(test.path());
-            child.envs(envars).args(&argv);
-            let others = other_binaries.iter().cloned().collect();
+            let mut child = llvm_test_command(test.path(), &cargo_config, &argv);
+            child.envs(envars);
+            let others = other_binaries.to_vec();
             let hnd = RunningProcessHandle::new(test, others, &mut child, config)?;
             Ok(hnd.into())
         }
@@ -274,31 +315,27 @@ fn execute_test(
             debug!("Args: {:?}", argv);
             execute(test.path(), &argv, envars.as_slice())
         }
-        e => Err(RunError::Engine(format!(
-            "invalid execution engine {:?}",
-            e
-        ))),
+        e => Err(RunError::Engine(format!("invalid execution engine {e:?}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cargo::CargoTargetRunner;
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     #[test]
     fn check_ld_library_path_correct() {
         let mut binary = TestBinary::new(PathBuf::from("dummy"), None);
         let default_config = Config::default();
+        let cargo_config = CargoConfigFields::default();
 
-        let vars = get_env_vars(&binary, &default_config);
+        let vars = get_env_vars(&binary, &default_config, &cargo_config);
 
-        if let Some(ld) = vars
-            .iter()
-            .find(|(key, _)| key == "LD_LIBRARY_PATH")
-            .map(|(_, val)| val)
-        {
-            let sys = env::var("LD_LIBRARY_PATH").unwrap();
+        if let Some(ld) = vars.get(LD_PATH_VAR) {
+            let sys = env::var(LD_PATH_VAR).unwrap();
             assert_eq!(ld, &sys);
         }
 
@@ -306,14 +343,66 @@ mod tests {
             .linker_paths
             .push(PathBuf::from("/usr/local/lib/foo"));
 
-        let vars = get_env_vars(&binary, &default_config);
-        let res = vars
-            .iter()
-            .find(|(key, _)| key == "LD_LIBRARY_PATH")
-            .map(|(_, val)| val);
+        let vars = get_env_vars(&binary, &default_config, &cargo_config);
+        let res = vars.get(LD_PATH_VAR);
 
         assert!(res.is_some());
         let res = res.unwrap();
         assert!(res.contains("/usr/local/lib/foo"));
+    }
+
+    fn command_parts(cmd: &Command) -> (OsString, Vec<OsString>) {
+        (
+            cmd.get_program().to_os_string(),
+            cmd.get_args().map(|x| x.to_os_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn llvm_command_runs_test_directly_without_runner() {
+        let cargo_config = CargoConfigFields::default();
+        let argv = vec!["--exact".to_string(), "my_test".to_string()];
+        let cmd = llvm_test_command(Path::new("target/debug/deps/foo"), &cargo_config, &argv);
+        let (program, args) = command_parts(&cmd);
+
+        assert_eq!(program, OsString::from("target/debug/deps/foo"));
+        assert_eq!(
+            args,
+            vec![OsString::from("--exact"), OsString::from("my_test")]
+        );
+    }
+
+    #[test]
+    fn llvm_command_runs_test_through_target_runner() {
+        let cargo_config = CargoConfigFields {
+            target_runner: Some(CargoTargetRunner {
+                path: PathBuf::from("wasm-bindgen-test-runner"),
+                args: vec![OsString::from("--node")],
+            }),
+            ..Default::default()
+        };
+        let argv = vec![
+            "--ignored".to_string(),
+            "--color".to_string(),
+            "always".to_string(),
+        ];
+        let cmd = llvm_test_command(
+            Path::new("target/wasm32/debug/deps/foo.wasm"),
+            &cargo_config,
+            &argv,
+        );
+        let (program, args) = command_parts(&cmd);
+
+        assert_eq!(program, OsString::from("wasm-bindgen-test-runner"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--node"),
+                OsString::from("target/wasm32/debug/deps/foo.wasm"),
+                OsString::from("--ignored"),
+                OsString::from("--color"),
+                OsString::from("always"),
+            ]
+        );
     }
 }

@@ -3,31 +3,81 @@ name: Release
 on:
   push:
     tags:
-      - '*.*.*'
-
+      - '[0-9]+.*'
 jobs:
-  release-crates:
+  create-release:
+    name: "Create GitHub release"
+    # only publish from the origin repository
+    if: github.repository_owner == 'xd009642'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - name: publish package to crates
         run: |
           cargo package
           cargo publish --token ${{ secrets.CARGO_TOKEN }}
 
-  release:
-    runs-on: ubuntu-latest
+  binaries:
+    name: "Upload release binaries"
+    needs:
+      - create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            build-target: x86_64-unknown-linux-gnu.2.31
+            build-tool: cargo-zigbuild
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            build-target: x86_64-unknown-linux-musl
+            build-tool: cargo-zigbuild
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            build-target: x86_64-apple-darwin
+            build-tool: cargo
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            build-target: x86_64-pc-windows-msvc
+            build-tool: cargo
+            os: windows-latest
+          - target: aarch64-unknown-linux-gnu
+            build-target: aarch64-unknown-linux-gnu.2.31
+            build-tool: cargo-zigbuild
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            build-target: aarch64-unknown-linux-musl
+            build-tool: cargo-zigbuild
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            build-target: aarch64-apple-darwin
+            build-tool: cargo
+            os: macos-latest
+          - target: universal-apple-darwin
+            build-target: universal-apple-darwin
+            build-tool: cargo
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v2
-      - name: build
-        run: cargo build --release
-      - name: archive
-        run: |
-          GIT_TAG=$(git describe --tags `git rev-list --tags --max-count=1`)
-          tar -C target/release -czf $(pwd)/cargo-tarpaulin-${GIT_TAG}-travis.tar.gz cargo-tarpaulin
-      - name: publish release
-        uses: softprops/action-gh-release@v1
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          files: cargo-tarpaulin-*.tar.gz
+          bin: cargo-tarpaulin
+          # Keep the public archive target stable for cargo-binstall while
+          # pinning GNU Linux artifacts to Debian bullseye's glibc floor.
+          archive: cargo-tarpaulin-${{ matrix.target }}
+          target: ${{ matrix.build-target }}
+          build-tool: ${{ matrix.build-tool }}
+          features: vendored-openssl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

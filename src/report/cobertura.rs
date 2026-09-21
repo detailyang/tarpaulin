@@ -47,8 +47,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use quick_xml::{
-    events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
     Writer,
+    events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
 };
 
 use chrono::offset::Utc;
@@ -64,7 +64,7 @@ pub fn report(traces: &TraceMap, config: &Config) -> Result<(), Error> {
 #[derive(Debug)]
 pub enum Error {
     Unknown,
-    ExportError(quick_xml::Error),
+    ExportError(std::io::Error),
 }
 
 impl error::Error for Error {}
@@ -73,7 +73,7 @@ impl fmt::Display for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::ExportError(ref e) => write!(f, "Export Error {}", e),
+            Error::ExportError(e) => write!(f, "Export Error {e}"),
             Error::Unknown => write!(f, "Unknown Error"),
         }
     }
@@ -120,8 +120,7 @@ impl Report {
 
     pub fn export(&self, config: &Config) -> Result<(), Error> {
         let file_path = config.output_dir().join("cobertura.xml");
-        let mut file =
-            File::create(file_path).map_err(|e| Error::ExportError(quick_xml::Error::Io(e)))?;
+        let mut file = File::create(file_path).map_err(|e| Error::ExportError(e))?;
 
         let mut writer = Writer::new(Cursor::new(vec![]));
         writer
@@ -163,11 +162,10 @@ impl Report {
             .map_err(Error::ExportError)?;
 
         let result = writer.into_inner().into_inner();
-        file.write_all(&result)
-            .map_err(|e| Error::ExportError(quick_xml::Error::Io(e)))
+        file.write_all(&result).map_err(|e| Error::ExportError(e))
     }
 
-    fn export_header<T: Write>(&self, writer: &mut Writer<T>) -> Result<(), quick_xml::Error> {
+    fn export_header<T: Write>(&self, writer: &mut Writer<T>) -> Result<(), std::io::Error> {
         let sources_tag = "sources";
         let source_tag = "source";
         writer.write_event(Event::Start(BytesStart::new(sources_tag)))?;
@@ -183,7 +181,7 @@ impl Report {
             .map(|_| ())
     }
 
-    fn export_packages<T: Write>(&self, writer: &mut Writer<T>) -> Result<(), quick_xml::Error> {
+    fn export_packages<T: Write>(&self, writer: &mut Writer<T>) -> Result<(), std::io::Error> {
         let packages_tag = "packages";
         let pack_tag = "package";
 
@@ -210,7 +208,7 @@ impl Report {
         &self,
         classes: &[Class],
         writer: &mut Writer<T>,
-    ) -> Result<(), quick_xml::Error> {
+    ) -> Result<(), std::io::Error> {
         let classes_tag = "classes";
         let class_tag = "class";
         let methods_tag = "methods";
@@ -238,7 +236,7 @@ impl Report {
         &self,
         lines: &[Line],
         writer: &mut Writer<T>,
-    ) -> Result<(), quick_xml::Error> {
+    ) -> Result<(), std::io::Error> {
         let lines_tag = "lines";
         let line_tag = "line";
 
@@ -246,10 +244,7 @@ impl Report {
         for line in lines {
             let mut l = BytesStart::new(line_tag);
             match line {
-                Line::Plain {
-                    ref number,
-                    ref hits,
-                } => {
+                Line::Plain { number, hits } => {
                     l.push_attribute(("number", number.to_string().as_ref()));
                     l.push_attribute(("hits", hits.to_string().as_ref()));
                 }
@@ -364,6 +359,8 @@ fn render_class(config: &Config, traces: &TraceMap, file: &Path) -> Option<Class
     }
 }
 
+/// So I don't currently export out methods for cobertura. This may change in future easily enough
+/// though so leaving the type here as a potential stub.
 #[derive(Debug)]
 struct Method {
     name: String,
@@ -371,14 +368,6 @@ struct Method {
     line_rate: f64,
     branch_rate: f64,
     lines: Vec<Line>,
-}
-
-fn render_methods() -> Vec<Method> {
-    unimplemented!()
-}
-
-fn render_method() -> Method {
-    unimplemented!()
 }
 
 #[derive(Debug)]
@@ -432,7 +421,7 @@ mod tests {
     #[test]
     fn package_coverage() {
         let mut config = Config::default();
-        config.manifest = PathBuf::from("fake/Cargo.toml");
+        config.set_manifest(PathBuf::from("fake/Cargo.toml"));
         let mut map = TraceMap::new();
 
         map.add_file(&PathBuf::from("fake/examples/foo.rs"));
@@ -440,7 +429,7 @@ mod tests {
         let empty_trace = Trace::new_stub(2);
         let mut address = HashSet::new();
         address.insert(2);
-        let hit_trace = Trace::new(3, address, 1, None);
+        let hit_trace = Trace::new(3, address, 1);
 
         let source_file = PathBuf::from("fake/src/lib.rs");
 

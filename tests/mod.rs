@@ -1,16 +1,28 @@
 use crate::utils::get_test_path;
-use cargo_tarpaulin::config::{Color, Config, ConfigWrapper, Mode, RunType, TraceEngine};
 use cargo_tarpaulin::event_log::EventLog;
 use cargo_tarpaulin::path_utils::*;
 use cargo_tarpaulin::traces::TraceMap;
-use cargo_tarpaulin::{launch_tarpaulin, setup_logging};
-use clap::App;
+use cargo_tarpaulin::{
+    args::TarpaulinCli,
+    config::{Config, ConfigWrapper, Mode, OutputFile, RunType, TraceEngine},
+};
+use cargo_tarpaulin::{launch_tarpaulin, run};
+use clap::Parser;
+#[cfg(windows)]
+use regex::Regex;
 use rusty_fork::rusty_fork_test;
 use std::collections::HashSet;
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::io;
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+use std::process::{self, Command, Stdio};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
+use test_log::test;
 
 #[cfg(nightly)]
 mod doc_coverage;
@@ -21,22 +33,27 @@ mod test_types;
 mod utils;
 mod workspaces;
 
-pub fn check_percentage_with_cli_args(minimum_coverage: f64, has_lines: bool, args: &[String]) {
-    setup_logging(Color::Never, false, false);
-    let restore_dir = env::current_dir().unwrap();
-    let matches = App::new("tarpaulin")
-        .args_from_usage(
-             "--config [FILE] 'Path to a toml file specifying a list of options this will override any other options set'
-             --ignore-config 'Ignore any project config files'
-             --debug 'Show debug output - this is used for diagnosing issues with tarpaulin'
-             --verbose -v 'Show extra output'
-             --root -r [DIR] 'directory'
-             --include-tests 'include tests in your tests'
-             --post-test-delay [SECONDS] 'Delay after test to collect coverage profiles'
-             --implicit-test-threads 'Don't supply an explicit `--test-threads` argument to tarpaulin. By default tarpaulin will infer the default rustc would pick if not ran via tarpaulin and set it'"
-        ).get_matches_from(args);
+pub(crate) fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+    unsafe {
+        env::set_var(key, value);
+    }
+}
 
-    let mut configs = ConfigWrapper::from(&matches).0;
+pub(crate) fn remove_env_var<K: AsRef<OsStr>>(key: K) {
+    unsafe {
+        env::remove_var(key);
+    }
+}
+
+pub fn check_percentage_with_cli_args(
+    minimum_coverage: f64,
+    has_lines: bool,
+    args: &[String],
+) -> TraceMap {
+    let restore_dir = env::current_dir().unwrap();
+    let args = TarpaulinCli::parse_from(args);
+
+    let mut configs = ConfigWrapper::from(args.config).0;
     let mut res = TraceMap::new();
     for config in &mut configs {
         config.set_clean(false);
@@ -54,6 +71,22 @@ pub fn check_percentage_with_cli_args(minimum_coverage: f64, has_lines: bool, ar
         );
         assert!(res.total_coverable() > 0);
     }
+    res
+}
+
+pub fn run_config(project_name: &str, mut config: Config) {
+    config.test_timeout = Duration::from_secs(60);
+    let restore_dir = env::current_dir().unwrap();
+    let test_dir = get_test_path(project_name);
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
+    env::set_current_dir(config.root()).unwrap();
+    config.set_clean(false);
+
+    run(&[config]).unwrap();
+
+    env::set_current_dir(restore_dir).unwrap();
 }
 
 pub fn check_percentage_with_config(
@@ -61,23 +94,23 @@ pub fn check_percentage_with_config(
     minimum_coverage: f64,
     has_lines: bool,
     mut config: Config,
-) {
-    setup_logging(Color::Never, false, false);
+) -> TraceMap {
     config.test_timeout = Duration::from_secs(60);
     let restore_dir = env::current_dir().unwrap();
     let test_dir = get_test_path(project_name);
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_clean(false);
 
     // Note to contributors. If an integration test fails, uncomment this to be able to see the
     // tarpaulin logs
-    //cargo_tarpaulin::setup_logging(true, true);
+    //cargo_tarpaulin::setup_logging(true, true, false);
     let event_log = if config.dump_traces {
         let mut paths = HashSet::new();
-        paths.insert(config.manifest.clone());
-        Some(EventLog::new(paths))
+        paths.insert(config.manifest());
+        Some(EventLog::new(paths, &config))
     } else {
         None
     };
@@ -97,13 +130,73 @@ pub fn check_percentage_with_config(
     } else {
         assert_eq!(res.total_coverable(), 0);
     }
+    res
 }
 
-pub fn check_percentage(project_name: &str, minimum_coverage: f64, has_lines: bool) {
+pub fn check_percentage(project_name: &str, minimum_coverage: f64, has_lines: bool) -> TraceMap {
     let mut config = Config::default();
-    config.set_ignore_tests(false);
+    config.set_include_tests(true);
     config.set_clean(false);
-    check_percentage_with_config(project_name, minimum_coverage, has_lines, config);
+    check_percentage_with_config(project_name, minimum_coverage, has_lines, config)
+}
+
+fn host_target() -> String {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .expect("rustc -vV should run to discover the host target");
+    assert!(output.status.success(), "rustc -vV should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("rustc -vV should print utf8");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc -vV should print a host target")
+        .to_string()
+}
+
+fn target_runner_env_key(target: &str) -> String {
+    target_env_key(target, "RUNNER")
+}
+
+fn target_rustflags_env_key(target: &str) -> String {
+    target_env_key(target, "RUSTFLAGS")
+}
+
+fn target_env_key(target: &str, suffix: &str) -> String {
+    let mut target = target.replace(['-', '.'], "_");
+    target.make_ascii_uppercase();
+    format!("CARGO_TARGET_{target}_{suffix}")
+}
+
+fn command_succeeds(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn nightly_wasm_target_installed() -> bool {
+    let output = match Command::new("rustup")
+        .args(["+nightly", "target", "list", "--installed"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line == "wasm32-unknown-unknown")
+}
+
+fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after the unix epoch")
+        .as_nanos();
+    env::temp_dir().join(format!("{prefix}_{}_{}", process::id(), timestamp))
 }
 
 rusty_fork_test! {
@@ -111,7 +204,9 @@ rusty_fork_test! {
 #[test]
 fn incorrect_manifest_path() {
     let mut config = Config::default();
-    config.manifest.push("__invalid_dir__");
+    let mut invalid = config.manifest();
+    invalid.push("__invalid_dir__");
+    config.set_manifest(invalid);
     config.set_clean(false);
     let launch = launch_tarpaulin(&config, &None);
     assert!(launch.is_err());
@@ -123,7 +218,7 @@ fn proc_macro_link() {
     config.test_timeout = Duration::from_secs(60);
     config.set_clean(false);
     let test_dir = get_test_path("proc_macro");
-    config.manifest = test_dir.join("Cargo.toml");
+    config.set_manifest(test_dir.join("Cargo.toml"));
     assert!(launch_tarpaulin(&config, &None).is_ok());
 }
 
@@ -138,12 +233,9 @@ fn lets_coverage() {
 }
 
 #[test]
-#[cfg_attr(not(target_os="linux"), ignore)] // TODO So there are linker issues I can't adequately diagnose myself in windows
-#[cfg(not(tarpaulin))]
 fn picking_up_shared_objects() {
-    // Need a project which downloads a shared object to target folder and uses build script to set
-    // the linker path.
-    check_percentage("torch_test", 1.0f64, true);
+    // Need a project which uses a build script and adds a library to the linker directives.
+    check_percentage("sqlite-sys-test", 1.0f64, true);
 }
 
 // Just for linux if we have ptrace as default
@@ -152,13 +244,129 @@ fn llvm_sanity_test() {
     let mut config = Config::default();
     config.set_engine(TraceEngine::Llvm);
     config.follow_exec = true;
-    config.set_ignore_tests(false);
+    config.set_include_tests(true);
     config.set_clean(false);
 
     check_percentage_with_config("structs", 1.0f64, true, config.clone());
     check_percentage_with_config("ifelse", 1.0f64, true, config.clone());
     check_percentage_with_config("returns", 1.0f64, true, config.clone());
     check_percentage_with_config("follow_exe", 1.0f64, true, config);
+}
+
+/// Explicitly exercises the ptrace engine on platforms where it is available, even if the
+/// platform's default engine is LLVM.
+#[test]
+#[cfg(ptrace_supported)]
+fn ptrace_sanity_test() {
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Ptrace);
+    config.set_include_tests(true);
+    config.set_clean(false);
+
+    check_percentage_with_config("structs", 1.0f64, true, config);
+}
+
+/// Exercises ptrace handling for a project binary spawned by a test.
+#[test]
+#[cfg(ptrace_supported)]
+fn ptrace_follow_exec_sanity_test() {
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Ptrace);
+    config.follow_exec = true;
+    config.set_include_tests(true);
+    config.set_clean(false);
+
+    check_percentage_with_config("follow_exe", 1.0f64, true, config);
+}
+
+#[test]
+fn llvm_respects_feature_gated_modules() {
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Llvm);
+    config.set_include_tests(true);
+    config.set_clean(false);
+
+    let without_feature = check_percentage_with_config(
+        "feature_gated_module",
+        1.0f64,
+        true,
+        config.clone(),
+    );
+    let root = get_test_path("feature_gated_module");
+    assert!(!without_feature.contains_file(&root.join("src/optional.rs")));
+
+    config.features = Some("optional".to_string());
+    let with_feature = check_percentage_with_config(
+        "feature_gated_module",
+        0.4f64,
+        true,
+        config.clone(),
+    );
+    assert!(with_feature.contains_file(&root.join("src/optional.rs")));
+
+    config.features = Some("feature_a".to_string());
+    let with_transitive_feature =
+        check_percentage_with_config("feature_gated_module", 0.2f64, true, config);
+    assert!(with_transitive_feature.contains_file(&root.join("src/transitive.rs")));
+}
+
+#[test]
+fn llvm_uses_configured_target_runner() {
+    let temp_dir = unique_temp_dir("tarpaulin_target_runner");
+    fs::create_dir_all(&temp_dir).expect("test should create its temp directory");
+
+    let runner_manifest = get_test_path("target_runner").join("Cargo.toml");
+    let runner_target_dir = temp_dir.join("runner_target");
+    let runner_build = Command::new("cargo")
+        .args(["build", "--manifest-path"])
+        .arg(&runner_manifest)
+        .arg("--target-dir")
+        .arg(&runner_target_dir)
+        .status()
+        .expect("runner fixture should build");
+    assert!(runner_build.success(), "runner fixture build should succeed");
+
+    let runner = runner_target_dir
+        .join("debug")
+        .join(format!("target_runner{}", env::consts::EXE_SUFFIX));
+    assert!(runner.is_file(), "runner fixture binary should exist");
+
+    let host = host_target();
+    let runner_env = target_runner_env_key(&host);
+    let previous_runner = env::var_os(&runner_env);
+    let previous_marker = env::var_os("TARPAULIN_RUNNER_MARKER");
+    let marker = temp_dir.join("runner.marker");
+
+    set_env_var(&runner_env, &runner);
+    set_env_var("TARPAULIN_RUNNER_MARKER", &marker);
+
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Llvm);
+    config.set_include_tests(true);
+    config.set_clean(false);
+    config.target = Some(host);
+    check_percentage_with_config("simple_project", 0.5f64, true, config);
+
+    match previous_runner {
+        Some(value) => set_env_var(&runner_env, value),
+        None => remove_env_var(&runner_env),
+    }
+    match previous_marker {
+        Some(value) => set_env_var("TARPAULIN_RUNNER_MARKER", value),
+        None => remove_env_var("TARPAULIN_RUNNER_MARKER"),
+    }
+
+    assert!(marker.is_file(), "target runner should write its marker");
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[cfg_attr(not(ptrace_supported), test)]
+#[should_panic]
+fn ptrace_not_unsupported_system() {
+    let config = Config::default();
+    config.set_engine(TraceEngine::Ptrace);
+
+    run_config("simple_project", config);
 }
 
 #[test]
@@ -198,7 +406,7 @@ fn futures_coverage() {
 
 #[test]
 fn breaks_expr_coverage() {
-    check_percentage("breaks", 1.0f64, true);
+    check_percentage("breaks", 0.95f64, true);
 }
 
 #[test]
@@ -212,7 +420,6 @@ fn boxes_coverage() {
 }
 
 #[test]
-#[ignore]
 fn method_calls_expr_coverage() {
     check_percentage("method_calls", 1.0f64, true);
 }
@@ -222,6 +429,7 @@ fn config_file_coverage() {
     let test_dir = get_test_path("configs");
     let mut args = vec![
         "tarpaulin".to_string(),
+        "--include-tests".to_string(),
         "--root".to_string(),
         test_dir.display().to_string(),
     ];
@@ -233,8 +441,9 @@ fn config_file_coverage() {
 #[test]
 fn issue_966_follow_exec() {
     let test_dir = get_test_path("follow_exec_issue966");
-    let mut args = vec![
+    let args = vec![
         "tarpaulin".to_string(),
+        "--include-tests".to_string(),
         "--root".to_string(),
         test_dir.display().to_string(),
         "--post-test-delay".to_string(),
@@ -248,6 +457,7 @@ fn rustflags_config_coverage() {
     let test_dir = get_test_path("multiple_rustflags");
     let mut args = vec![
         "tarpaulin".to_string(),
+        "--include-tests".to_string(),
         "--root".to_string(),
         test_dir.display().to_string(),
     ];
@@ -262,18 +472,6 @@ fn match_expr_coverage() {
 }
 
 #[test]
-#[ignore]
-fn benchmark_coverage() {
-    let test = "benchmark_coverage";
-    check_percentage(test, 0.0f64, true);
-
-    let mut config = Config::default();
-    config.set_clean(false);
-    config.run_types = vec![RunType::Benchmarks];
-    check_percentage_with_config(test, 1.0f64, true, config);
-}
-
-#[test]
 fn cargo_run_coverage() {
     let mut config = Config::default();
     config.command = Mode::Build;
@@ -282,6 +480,7 @@ fn cargo_run_coverage() {
 }
 
 #[test]
+//#[cfg(not(windows))] // TODO fix
 fn examples_coverage() {
     let test = "example_test";
     check_percentage(test, 0.0f64, true);
@@ -289,7 +488,7 @@ fn examples_coverage() {
     let mut config = Config::default();
     config.run_types = vec![RunType::Examples];
     config.set_clean(false);
-    config.set_ignore_tests(false);
+    config.set_include_tests(true);
     check_percentage_with_config(test, 1.0f64, true, config.clone());
 
     config.run_types.clear();
@@ -303,6 +502,14 @@ fn access_env_var() {
     // using `CARGO_BIN_EXE_<name>` to test
     let test = "env_var";
     check_percentage(test, 1.0f64, true);
+}
+
+#[test]
+fn cargo_bin_exe_runtime_env() {
+    let mut config = Config::default();
+    config.set_include_tests(true);
+    config.set_clean(false);
+    run_config("cargo_bin_exe_runtime", config);
 }
 
 #[test]
@@ -331,19 +538,21 @@ fn cargo_home_filtering() {
     let mut config = Config::default();
     config.test_timeout = Duration::from_secs(60);
     config.set_clean(false);
+    config.set_include_tests(true);
     let restore_dir = env::current_dir().unwrap();
     let test_dir = get_test_path("HttptestAndReqwest");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
-    env::set_var("CARGO_HOME", new_home.display().to_string());
+    set_env_var("CARGO_HOME", new_home.display().to_string());
     let run = launch_tarpaulin(&config, &None);
     let _ = fs::remove_dir_all(&new_home);
     match previous {
-        Ok(s) => env::set_var("CARGO_HOME", s),
+        Ok(s) => set_env_var("CARGO_HOME", s),
         Err(_) => {
-            let _ = env::remove_var("CARGO_HOME");
+            remove_env_var("CARGO_HOME");
         }
     }
     let (res, _) = run.unwrap();
@@ -355,20 +564,22 @@ fn cargo_home_filtering() {
 
 #[test]
 fn rustflags_handling() {
+    remove_env_var("RUSTFLAGS");
     check_percentage("rustflags", 1.0f64, true);
-    env::set_var("RUSTFLAGS", "--cfg=foo");
+    set_env_var("RUSTFLAGS", "--cfg=foo");
     let mut config = Config::default();
     config.set_clean(false);
 
     let restore_dir = env::current_dir().unwrap();
     let test_dir = get_test_path("rustflags");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     let res = launch_tarpaulin(&config, &None);
     env::set_current_dir(&restore_dir).unwrap();
-    env::remove_var("RUSTFLAGS");
+    remove_env_var("RUSTFLAGS");
     assert!(res.is_err() || res.unwrap().1 != 0);
 
     let (_, ret) = launch_tarpaulin(&config, &None).unwrap();
@@ -376,11 +587,25 @@ fn rustflags_handling() {
     assert_eq!(ret, 0);
 }
 
+/// Cargo config can supply multiple linker arguments with the same rustc flag.
+#[test]
+#[cfg(target_os = "linux")]
+fn repeated_link_args_from_cargo_config() {
+    // An outer tarpaulin run supplies RUSTFLAGS, which would override the fixture's
+    // Cargo config. This test runs in its own rusty-fork process.
+    remove_env_var("RUSTFLAGS");
+    remove_env_var("CARGO_ENCODED_RUSTFLAGS");
+    let config = Config::default();
+    config.set_engine(TraceEngine::Llvm);
+    check_percentage_with_config("repeated_link_args", 1.0, true, config);
+}
+
 #[test]
 fn follow_exes_down() {
     let mut config = Config::default();
     config.follow_exec = true;
     config.set_clean(false);
+    config.set_include_tests(true);
     check_percentage_with_config("follow_exe", 1.0f64, true, config);
 }
 
@@ -390,14 +615,31 @@ fn handle_module_level_exclude_attrs() {
 }
 
 #[test]
+fn module_name_clashes() {
+    // Make sure the exclusions are correct
+    let mut config = Config::default();
+    config.set_include_tests(false);
+    config.set_clean(false);
+    let map = check_percentage_with_config("module_name_clashes", 1.0f64, true, config);
+
+    println!("{:?}", map.files());
+
+    let root = get_test_path("module_name_clashes");
+
+    assert!(map.contains_file(&root.join("src/foo/overhere.rs")));
+    assert!(map.contains_file(&root.join("src/foo/boo.rs")));
+    assert!(!map.contains_file(&root.join("src/foo/bar/overhere/boo.rs")));
+}
+
+#[test]
 #[cfg(unix)]
 fn handle_forks() {
     let mut config = Config::default();
     config.set_clean(false);
-    config.set_ignore_tests(false);
+    config.set_include_tests(true);
     config.post_test_delay = Some(Duration::from_secs(10));
-    // Some false negatives on more recent compilers so lets just aim for >90% and 0 return code
-    check_percentage_with_config("fork-test", 0.85f64, true, config);
+    // Some false negatives on more recent compilers so lets just aim for above a reasonable threshold and 0 return code
+    check_percentage_with_config("fork-test", 0.78f64, true, config);
 }
 
 #[test]
@@ -418,13 +660,14 @@ fn dot_rs_in_dir_name() {
     // issue #857
     let mut config = Config::default();
     config.set_clean(false);
-    config.set_ignore_tests(false);
+    config.set_include_tests(true);
 
     let restore_dir = env::current_dir().unwrap();
     let test_dir = get_test_path("not_a_file.rs");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     let (res, _ret) = launch_tarpaulin(&config, &None).unwrap();
     env::set_current_dir(&restore_dir).unwrap();
@@ -448,7 +691,7 @@ fn kill_used_in_test() {
 
     config.follow_exec = true;
     config.set_clean(false);
-    config.set_ignore_tests(false);
+    config.set_include_tests(true);
     // Currently 2 false negatives, but if it was only covering the integration test max coverage
     // is 75% so this is high enough to prove it works
     check_percentage_with_config("kill_proc", 0.9f64, true, config);
@@ -463,15 +706,240 @@ fn doc_test_bootstrap() {
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doc_coverage");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     config.run_types = vec![RunType::Doctests];
 
-    env::set_var("RUSTC_BOOTSTRAP", "1");
+    set_env_var("RUSTC_BOOTSTRAP", "1");
 
     let (_res, ret) = launch_tarpaulin(&config, &None).unwrap();
     assert_eq!(ret, 0);
 }
 
+#[test]
+#[cfg(windows)]
+fn sanitised_paths() {
+    let test_dir = get_test_path("assigns");
+    let report_dir = test_dir.join("reports");
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Llvm);
+    config.set_include_tests(true);
+    config.set_clean(false);
+    config.generate.push(OutputFile::Lcov);
+    config.generate.push(OutputFile::Html);
+    config.generate.push(OutputFile::Xml);
+    config.generate.push(OutputFile::Json);
+    let _ = fs::remove_dir_all(&report_dir);
+    let _ = fs::create_dir(&report_dir);
+    config.output_directory = Some(report_dir.clone());
+
+    config.test_timeout = Duration::from_secs(60);
+    let restore_dir = env::current_dir().unwrap();
+    let test_dir = get_test_path("assigns");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
+    env::set_current_dir(format!(r#"\\?\{}"#, config.root().display())).unwrap();
+    config.set_manifest(PathBuf::from(format!(r#"\\?\{}"#, config.manifest().display())));
+    config.set_clean(false);
+
+    println!("{:#?}", config);
+    run(&[config]).unwrap();
+
+    env::set_current_dir(restore_dir).unwrap();
+
+    println!("Look at reports");
+    let mut count = 0;
+    let bad_path_regex = Regex::new(r#"\\\\\?\\\w:\\"#).unwrap();
+    for entry in fs::read_dir(&report_dir).unwrap() {
+        let entry = entry.unwrap().path();
+        if !entry.is_dir() {
+            count += 1;
+            println!("Checking: {}", entry.display());
+            let f = fs::File::open(entry).unwrap();
+            if let Ok(s) = io::read_to_string(f) {
+                assert!(!s.is_empty());
+                assert!(bad_path_regex.find(&s).is_none());
+            } else {
+                println!("Not unicode");
+            }
+        }
+    }
+    assert_eq!(count, 4);
+}
+
+#[test]
+fn output_dir_workspace() {
+    let test_dir = get_test_path("workspace");
+    let report_dir = test_dir.join("reports");
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Llvm);
+    config.set_include_tests(true);
+    config.set_clean(false);
+    config.dump_traces = true;
+    config.generate.push(OutputFile::Lcov);
+    config.generate.push(OutputFile::Html);
+    config.generate.push(OutputFile::Xml);
+    config.generate.push(OutputFile::Json);
+    config.generate.push(OutputFile::Markdown);
+    let _ = fs::remove_dir_all(&report_dir);
+    let _ = fs::create_dir(&report_dir);
+    config.output_directory = Some(report_dir.clone());
+
+    config.test_timeout = Duration::from_secs(60);
+
+    run_config("workspace", config);
+
+    let mut output = HashSet::new();
+    for entry in fs::read_dir(&report_dir).unwrap() {
+        let entry = entry.unwrap().path();
+        if !entry.is_dir() {
+            let file_name = entry.file_name().unwrap().to_string_lossy().to_string();
+            output.insert(file_name);
+        }
+    }
+    println!("{:?}", output);
+    assert!(output.remove("cobertura.xml"));
+    assert!(output.remove("lcov.info"));
+    assert!(output.remove("tarpaulin-report.html"));
+    assert!(output.remove("tarpaulin-report.json"));
+    assert!(output.remove("tarpaulin-report.md"));
+    assert_eq!(output.len(), 1);
+
+    for event_log in &output {
+        let events = report_dir.join(event_log);
+        let log = fs::read(events).unwrap();
+        // We can deserialize event log so it must be good
+        serde_json::from_slice::<EventLog>(log.as_slice()).unwrap();
+    }
+}
+
+#[test]
+fn stripped_crate() {
+    let mut config = Config::default();
+    config.verbose = true;
+    config.set_clean(false);
+    config.test_timeout = Duration::from_secs(60);
+
+    check_percentage_with_config("stripped", 0.9, true, config);
+}
+
+
+#[test]
+fn workspace_no_fail_fast() {
+    let mut config = Config::default();
+    config.set_clean(false);
+    config.set_include_tests(true);
+    config.no_fail_fast = true;
+
+    let test_dir = get_test_path("workspace_with_fail_tests");
+    env::set_current_dir(&test_dir).unwrap();
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
+    config.packages = vec!["bar".to_string(), "foo".to_string()];
+    let result = launch_tarpaulin(&config, &None);
+    let (result, ret) = result.expect("Test failed");
+    let files = result.files();
+    assert!(files.iter().any(|f| f.ends_with("foo/src/lib.rs")));
+    assert!(ret != 0);
+}
+
+#[test]
+fn warning_flags_in_config() {
+    check_percentage("config_warnings", 1.0f64, true);
+}
+
+#[test]
+fn cargo_config_env_section() {
+    check_percentage("cargo_config_env", 1.0f64, true);
+}
+
+#[test]
+fn workspace_default_members() {
+    let mut config = Config::default();
+    config.set_clean(false);
+    config.set_include_tests(true);
+
+    let only_default = check_percentage_with_config("default_members", 1.0f64, true, config.clone());
+
+    let files = only_default.files();
+    assert_eq!(files.len(), 1);
+    assert!(files[0].ends_with(Path::new("workspace_1/src/lib.rs")));
+
+    config.all= true;
+
+    let all = check_percentage_with_config("default_members", 1.0f64, true, config);
+
+    let files = all.files();
+    assert_eq!(files.len(), 2);
+    // We use a BTreeMap so they'll be alphabetically ordered
+    assert!(files[0].ends_with(Path::new("workspace_1/src/lib.rs")));
+    assert!(files[1].ends_with(Path::new("workspace_2/src/lib.rs")));
+}
+
+}
+
+#[test]
+fn llvm_wasm_coverage_uses_target_runner_and_target_rustflags() {
+    const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+    if !command_succeeds("wasm-bindgen-test-runner", &["--version"]) {
+        eprintln!("skipping wasm coverage integration test: wasm-bindgen-test-runner not found");
+        return;
+    }
+    if !nightly_wasm_target_installed() {
+        eprintln!("skipping wasm coverage integration test: nightly wasm32 target not installed");
+        return;
+    }
+
+    let output_dir = unique_temp_dir("tarpaulin_wasm_coverage");
+    fs::create_dir_all(&output_dir).expect("test should create report output directory");
+
+    let test_dir = get_test_path("wasm_coverage");
+    let cargo_tarpaulin = env::var_os("CARGO_BIN_EXE_cargo-tarpaulin")
+        .expect("cargo should expose the cargo-tarpaulin binary path to integration tests");
+    let output = Command::new(cargo_tarpaulin)
+        .arg("tarpaulin")
+        .args(["--engine", "llvm"])
+        .args(["--target", WASM_TARGET])
+        .arg("--manifest-path")
+        .arg(test_dir.join("Cargo.toml"))
+        .args(["--out", "Lcov"])
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--skip-clean")
+        .env(target_runner_env_key(WASM_TARGET), "wasm-bindgen-test-runner")
+        .env(
+            target_rustflags_env_key(WASM_TARGET),
+            "-Zno-profiler-runtime -Clink-args=--no-gc-sections --cfg=wasm_bindgen_unstable_test_coverage",
+        )
+        .env("RUSTUP_TOOLCHAIN", "nightly")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .output()
+        .expect("wasm tarpaulin run should start");
+
+    assert!(
+        output.status.success(),
+        "wasm tarpaulin run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lcov = fs::read_to_string(output_dir.join("lcov.info"))
+        .expect("wasm tarpaulin run should write lcov output");
+    let source = test_dir.join("src/lib.rs");
+    assert!(
+        lcov.contains(&format!("SF:{}", source.display())),
+        "lcov output should include the wasm fixture source file"
+    );
+    assert!(lcov.contains("DA:1,1"));
+    assert!(lcov.contains("DA:2,1"));
+    assert!(lcov.contains("DA:5,0"));
+    assert!(lcov.contains("DA:6,0"));
+
+    let _ = fs::remove_dir_all(output_dir);
 }

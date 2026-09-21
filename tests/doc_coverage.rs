@@ -1,21 +1,22 @@
 use crate::utils::get_test_path;
-use cargo_tarpaulin::config::{Color, Config, RunType};
-use cargo_tarpaulin::{launch_tarpaulin, setup_logging};
+use cargo_tarpaulin::config::{Color, Config, RunType, TraceEngine};
+use cargo_tarpaulin::launch_tarpaulin;
 use rusty_fork::rusty_fork_test;
 use std::time::Duration;
 use std::{env, path::PathBuf};
+use test_log::test;
 
 rusty_fork_test! {
 #[test]
 fn doc_test_env() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     config.set_clean(false);
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doctest_env");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_profraw_folder(PathBuf::from("doc_test_env"));
 
     config.run_types = vec![RunType::Doctests];
@@ -29,15 +30,15 @@ fn doc_test_env() {
 
 #[test]
 fn doc_test_coverage() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     config.verbose = true;
     config.set_clean(false);
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doc_coverage");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     config.run_types = vec![RunType::Doctests];
     config.set_profraw_folder(PathBuf::from("doc_test_coverage_1"));
@@ -59,15 +60,15 @@ fn doc_test_coverage() {
 
 #[test]
 fn doc_test_panics() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     config.verbose = true;
     config.set_clean(false);
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doctest_should_panic");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     config.run_types = vec![RunType::Doctests];
     config.set_profraw_folder(PathBuf::from("doc_test_panics_1"));
@@ -89,15 +90,15 @@ fn doc_test_panics() {
 
 #[test]
 fn doc_test_panics_workspace() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     config.verbose = true;
     config.set_clean(false);
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doctest_workspace_should_panic");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
     config.set_profraw_folder(PathBuf::from("doc_test_panics_workspace_1"));
 
     config.run_types = vec![RunType::Doctests];
@@ -119,15 +120,15 @@ fn doc_test_panics_workspace() {
 
 #[test]
 fn doc_test_compile_fail() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     config.verbose = true;
     config.set_clean(false);
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doctest_compile_fail_fail");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     config.run_types = vec![RunType::Doctests];
 
@@ -136,19 +137,70 @@ fn doc_test_compile_fail() {
 
 #[test]
 fn doc_test_no_run() {
-    setup_logging(Color::Never, false, false);
     let mut config = Config::default();
     config.verbose = true;
     config.set_clean(false);
     config.test_timeout = Duration::from_secs(60);
     let test_dir = get_test_path("doctest_norun");
     env::set_current_dir(&test_dir).unwrap();
-    config.manifest = test_dir;
-    config.manifest.push("Cargo.toml");
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
 
     config.run_types = vec![RunType::Doctests];
 
     let (_, ret) = launch_tarpaulin(&config, &None).unwrap();
     assert_eq!(ret, 0);
+}
+
+#[test]
+fn rustdocflags_handling() {
+    crate::set_env_var("RUSTDOCFLAGS", "--cfg=foo");
+    let mut config = Config::default();
+    config.run_types = vec![RunType::Doctests];
+    config.set_clean(false);
+
+    let restore_dir = env::current_dir().unwrap();
+    let test_dir = get_test_path("rustflags");
+    env::set_current_dir(&test_dir).unwrap();
+    let mut manifest = test_dir;
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
+
+    let res = launch_tarpaulin(&config, &None);
+    env::set_current_dir(&restore_dir).unwrap();
+    crate::remove_env_var("RUSTDOCFLAGS");
+    assert!(res.is_err() || res.unwrap().1 != 0);
+
+    let (_, ret) = launch_tarpaulin(&config, &None).unwrap();
+    env::set_current_dir(&restore_dir).unwrap();
+    assert_eq!(ret, 0);
+}
+
+/// An existing rustdoc persistence option must not discard unrelated user flags.
+#[test]
+fn rustdoc_persist_doctests_preserves_other_flags() {
+    let mut config = Config::default();
+    config.set_engine(TraceEngine::Llvm);
+    config.run_types = vec![RunType::Doctests];
+    config.set_clean(false);
+    config.test_timeout = Duration::from_secs(60);
+
+    let test_dir = get_test_path("rustdoc_persist_flags");
+    let mut manifest = test_dir.clone();
+    manifest.push("Cargo.toml");
+    config.set_manifest(manifest);
+    crate::set_env_var(
+        "RUSTDOCFLAGS",
+        format!(
+            "--persist-doctests {} --cfg=doc_custom",
+            test_dir.join("unused-doctests").display()
+        ),
+    );
+    let result = launch_tarpaulin(&config, &None);
+    crate::remove_env_var("RUSTDOCFLAGS");
+
+    let (_, exit_code) = result.expect("tarpaulin should run the doctest");
+    assert_eq!(exit_code, 0, "the doctest should receive doc_custom");
 }
 }

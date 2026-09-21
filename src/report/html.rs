@@ -3,8 +3,9 @@ use crate::errors::*;
 use crate::report::{get_previous_result, safe_json};
 use crate::traces::{Trace, TraceMap};
 use serde::Serialize;
-use std::fs::{read_to_string, File};
+use std::fs::{File, read_to_string};
 use std::io::{self, Write};
+use tracing::info;
 
 #[derive(Serialize)]
 struct SourceFile {
@@ -39,8 +40,7 @@ fn get_json(coverage_data: &TraceMap, context: Context) -> Result<String, RunErr
                 }
 
                 return Err(RunError::Html(format!(
-                    "Unable to read source file to string: {}",
-                    e
+                    "Unable to read source file to string: {e}"
                 )));
             }
         };
@@ -58,14 +58,14 @@ fn get_json(coverage_data: &TraceMap, context: Context) -> Result<String, RunErr
     }
 
     safe_json::to_string_safe(&report)
-        .map_err(|e| RunError::Html(format!("Report isn't serializable: {}", e)))
+        .map_err(|e| RunError::Html(format!("Report isn't serializable: {e}")))
 }
 
 pub fn export(coverage_data: &TraceMap, config: &Config) -> Result<(), RunError> {
     let file_path = config.output_dir().join("tarpaulin-report.html");
-    let mut file = match File::create(file_path) {
+    let mut file = match File::create(&file_path) {
         Ok(k) => k,
-        Err(e) => return Err(RunError::Html(format!("File is not writeable: {}", e))),
+        Err(e) => return Err(RunError::Html(format!("File is not writeable: {e}"))),
     };
 
     let report_json = get_json(coverage_data, Context::CurrentResults)?;
@@ -80,6 +80,8 @@ pub fn export(coverage_data: &TraceMap, config: &Config) -> Result<(), RunError>
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Tarpaulin coverage report</title>
     <style>{}</style>
 </head>
 <body>
@@ -103,6 +105,8 @@ pub fn export(coverage_data: &TraceMap, config: &Config) -> Result<(), RunError>
         Ok(_) => (),
         Err(e) => return Err(RunError::Html(e.to_string())),
     };
+
+    info!("HTML report written to {}", file_path.display());
 
     Ok(())
 }

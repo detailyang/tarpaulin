@@ -10,10 +10,11 @@ use crate::test_loader::*;
 use crate::traces::*;
 use std::ffi::OsString;
 use std::fs::{create_dir_all, remove_dir_all};
+use std::io;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{filter::LevelFilter, EnvFilter};
+use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
-pub mod branching;
+pub mod args;
 pub mod cargo;
 pub mod config;
 pub mod errors;
@@ -28,15 +29,19 @@ pub mod traces;
 
 const RUST_LOG_ENV: &str = "RUST_LOG";
 
-pub fn setup_logging(color: Color, debug: bool, verbose: bool) {
+#[cfg(not(tarpaulin_include))]
+pub fn setup_logging(color: Color, debug: bool, verbose: bool, stderr: bool) {
     //By default, we set tarpaulin to info,debug,trace while all dependencies stay at INFO
     let base_exceptions = |env: EnvFilter| {
         if debug {
             env.add_directive("cargo_tarpaulin=trace".parse().unwrap())
+                .add_directive("llvm_profparser=trace".parse().unwrap())
         } else if verbose {
             env.add_directive("cargo_tarpaulin=debug".parse().unwrap())
+                .add_directive("llvm_profparser=warn".parse().unwrap())
         } else {
             env.add_directive("cargo_tarpaulin=info".parse().unwrap())
+                .add_directive("llvm_profparser=error".parse().unwrap())
         }
         .add_directive(LevelFilter::INFO.into())
     };
@@ -52,7 +57,7 @@ pub fn setup_logging(color: Color, debug: bool, verbose: bool) {
             for s in env.split(',') {
                 match s.parse() {
                     Ok(d) => filter = filter.add_directive(d),
-                    Err(err) => println!("WARN ignoring log directive: `{}`: {}", s, err),
+                    Err(err) => println!("WARN ignoring log directive: `{s}`: {err}"),
                 };
             }
             filter
@@ -62,25 +67,32 @@ pub fn setup_logging(color: Color, debug: bool, verbose: bool) {
 
     let with_ansi = color != Color::Never;
 
-    let res = tracing_subscriber::FmtSubscriber::builder()
+    let builder = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::ERROR)
         .with_env_filter(filter)
-        .with_ansi(with_ansi)
-        .try_init();
+        .with_ansi(with_ansi);
+
+    let res = if stderr {
+        builder.with_writer(io::stderr).try_init()
+    } else {
+        builder.try_init()
+    };
 
     if let Err(e) = res {
-        eprintln!("Logging may be misconfigured: {}", e);
+        eprintln!("Logging may be misconfigured: {e}");
     }
 
     debug!("set up logging");
 }
 
-pub fn trace(configs: &[Config]) -> Result<TraceMap, RunError> {
+pub fn trace(configs: &[Config]) -> Result<(TraceMap, i32), RunError> {
     let logger = create_logger(configs);
     let mut tracemap = TraceMap::new();
     let mut ret = 0;
+    let mut fail_fast_ret = 0;
     let mut tarpaulin_result = Ok(());
     let mut bad_threshold = Ok(());
+
     for config in configs.iter() {
         if config.name == "report" {
             continue;
@@ -95,7 +107,11 @@ pub fn trace(configs: &[Config]) -> Result<TraceMap, RunError> {
 
         match launch_tarpaulin(config, &logger) {
             Ok((t, r)) => {
-                ret |= r;
+                if config.no_fail_fast {
+                    fail_fast_ret |= r;
+                } else {
+                    ret |= r;
+                }
                 if configs.len() > 1 {
                     // Otherwise threshold is a global one and we'll let the caller handle it
                     bad_threshold = check_fail_threshold(&t, config);
@@ -103,7 +119,7 @@ pub fn trace(configs: &[Config]) -> Result<TraceMap, RunError> {
                 tracemap.merge(&t);
             }
             Err(e) => {
-                error!("{}", e);
+                error!("{e}");
                 tarpaulin_result = tarpaulin_result.and(Err(e));
             }
         }
@@ -114,10 +130,10 @@ pub fn trace(configs: &[Config]) -> Result<TraceMap, RunError> {
     // It's OK that bad_threshold, tarpaulin_result may be overwritten in a loop
     if let Err(bad_limit) = bad_threshold {
         // Failure threshold probably more important than reporting failing
-        let _ = report_coverage(&configs[0], &tracemap);
+        let _ = report_tracemap(configs, tracemap);
         Err(bad_limit)
     } else if ret == 0 {
-        tarpaulin_result.map(|_| tracemap)
+        tarpaulin_result.map(|_| (tracemap, fail_fast_ret))
     } else {
         Err(RunError::TestFailed)
     }
@@ -125,7 +141,16 @@ pub fn trace(configs: &[Config]) -> Result<TraceMap, RunError> {
 
 fn create_logger(configs: &[Config]) -> Option<EventLog> {
     if configs.iter().any(|c| c.dump_traces) {
-        Some(EventLog::new(configs.iter().map(|x| x.root()).collect()))
+        let config = if let Some(c) = configs.iter().find(|c| c.output_directory.is_some()) {
+            c
+        } else {
+            &configs[0]
+        };
+
+        Some(EventLog::new(
+            configs.iter().map(|x| x.root()).collect(),
+            config,
+        ))
     } else {
         None
     }
@@ -171,12 +196,19 @@ pub fn run(configs: &[Config]) -> Result<(), RunError> {
             );
         }
     }
-    let tracemap = collect_tracemap(configs)?;
-    report_tracemap(configs, tracemap)
+    let (tracemap, ret) = collect_tracemap(configs)?;
+    report_tracemap(configs, tracemap)?;
+    if ret != 0 {
+        // So we had a test fail in a way where we still want to report coverage so since we've now
+        // done that we can return the test failed error.
+        Err(RunError::TestFailed)
+    } else {
+        Ok(())
+    }
 }
 
-fn collect_tracemap(configs: &[Config]) -> Result<TraceMap, RunError> {
-    let mut tracemap = trace(configs)?;
+fn collect_tracemap(configs: &[Config]) -> Result<(TraceMap, i32), RunError> {
+    let (mut tracemap, ret) = trace(configs)?;
     if !configs.is_empty() {
         // Assumption: all configs are for the same project
         for dir in get_source_walker(&configs[0]) {
@@ -184,16 +216,18 @@ fn collect_tracemap(configs: &[Config]) -> Result<TraceMap, RunError> {
         }
     }
 
-    Ok(tracemap)
+    Ok((tracemap, ret))
 }
 
-fn report_tracemap(configs: &[Config], tracemap: TraceMap) -> Result<(), RunError> {
+pub fn report_tracemap(configs: &[Config], mut tracemap: TraceMap) -> Result<(), RunError> {
     let mut reported = false;
     for c in configs.iter() {
         if c.no_run || c.name != "report" {
+            tracemap.insert_settings(c.get_tracemap_settings());
             continue;
         }
 
+        tracemap.insert_settings(c.get_tracemap_settings());
         report_coverage_with_check(c, &tracemap)?;
         reported = true;
     }
@@ -227,19 +261,36 @@ pub fn launch_tarpaulin(
     let executables = cargo::get_tests(config)?;
     if !config.no_run {
         let project_analysis = SourceAnalysis::get_analysis(config);
+        result.set_functions(project_analysis.create_function_map());
         let project_analysis = project_analysis.lines;
+        let mut other_bins = config.objects().to_vec();
+        other_bins.extend(executables.binaries.iter().cloned());
         for exe in &executables.test_binaries {
             if exe.should_panic() {
                 info!("Running a test executable that is expected to panic");
             }
             let coverage = get_test_coverage(
                 exe,
-                &executables.binaries,
+                &other_bins,
                 &project_analysis,
                 config,
+                executables.cargo_config.clone(),
                 false,
                 logger,
-            )?;
+            );
+
+            let coverage = match coverage {
+                Ok(coverage) => coverage,
+                Err(run_error) => {
+                    if config.no_fail_fast {
+                        info!("No failing fast!");
+                        return_code = 101;
+                        None
+                    } else {
+                        return Err(run_error);
+                    }
+                }
+            };
             if let Some(res) = coverage {
                 result.merge(&res.0);
                 return_code |= if exe.should_panic() {
@@ -251,16 +302,32 @@ pub fn launch_tarpaulin(
             if config.run_ignored {
                 let coverage = get_test_coverage(
                     exe,
-                    &executables.binaries,
+                    &other_bins,
                     &project_analysis,
                     config,
+                    executables.cargo_config.clone(),
                     true,
                     logger,
-                )?;
+                );
+                let coverage = match coverage {
+                    Ok(coverage) => coverage,
+                    Err(run_error) => {
+                        if config.no_fail_fast {
+                            return_code = 101;
+                            None
+                        } else {
+                            return Err(run_error);
+                        }
+                    }
+                };
                 if let Some(res) = coverage {
                     result.merge(&res.0);
                     return_code |= res.1;
                 }
+            }
+
+            if config.fail_immediately && return_code != 0 {
+                return Err(RunError::TestFailed);
             }
         }
         result.dedup();

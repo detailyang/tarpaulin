@@ -1,6 +1,4 @@
 use crate::source_analysis::prelude::*;
-use std::path::PathBuf;
-use syn::{spanned::Spanned, *};
 
 impl SourceAnalysis {
     pub(crate) fn process_items(&mut self, items: &[Item], ctx: &Context) -> SubResult {
@@ -31,7 +29,7 @@ impl SourceAnalysis {
                 }
                 Item::Trait(i) => self.visit_trait(i, ctx),
                 Item::Impl(i) => self.visit_impl(i, ctx),
-                Item::Macro(ref i) => {
+                Item::Macro(i) => {
                     if self.visit_macro_call(&i.mac, ctx).is_unreachable() {
                         res = SubResult::Unreachable;
                     }
@@ -46,80 +44,121 @@ impl SourceAnalysis {
         res
     }
 
-    fn visit_mod(&mut self, module: &ItemMod, ctx: &Context) {
-        let analysis = self.get_line_analysis(ctx.file.to_path_buf());
-        analysis.ignore_tokens(module.mod_token);
-        let mut check_insides = true;
-        for attr in &module.attrs {
-            if let Ok(x) = attr.parse_meta() {
-                if check_cfg_attr(&x) {
-                    analysis.ignore_tokens(module);
-                    if let Some((ref braces, _)) = module.content {
-                        analysis.ignore_span(braces.span);
-                    }
-                    check_insides = false;
-                    break;
-                } else if ctx.config.ignore_tests() && x.path().is_ident("cfg") {
-                    if let Meta::List(ref ml) = x {
-                        for nested in &ml.nested {
-                            if let NestedMeta::Meta(Meta::Path(ref i)) = *nested {
-                                if i.is_ident("test") {
-                                    check_insides = false;
-                                    analysis.ignore_tokens(module.mod_token);
-                                    if let Some((ref braces, _)) = module.content {
-                                        analysis.ignore_span(braces.span);
-                                    }
-                                }
-                            }
+    fn ignore_nested_modules(&mut self, items: &[Item], ctx: &Context) {
+        for item in items.iter() {
+            if let Item::Mod(m) = item {
+                if let Some((_, ref items)) = m.content {
+                    let _guard = ctx.push_to_symbol_stack(m.ident.to_string());
+                    self.ignore_nested_modules(items, ctx);
+                } else {
+                    // ignore whole ass module
+                    let mut p = if let Some(parent) = ctx.file.parent() {
+                        parent.to_path_buf()
+                    } else {
+                        PathBuf::new()
+                    };
+                    match ctx.file.file_stem().and_then(|x| x.to_str()) {
+                        Some(name) if !["lib", "mod"].contains(&name) => {
+                            p.push(name);
                         }
+                        _ => {}
                     }
+                    for s in ctx.symbol_stack.borrow().iter() {
+                        p.push(s);
+                    }
+                    p.push(m.ident.to_string());
+                    if !p.exists() {
+                        p.set_extension("rs");
+                    }
+                    ctx.ignore_mods.borrow_mut().insert(p);
                 }
             }
         }
-        if check_insides {
+    }
+
+    fn visit_mod(&mut self, module: &ItemMod, ctx: &Context) {
+        let _guard = ctx.push_to_symbol_stack(module.ident.to_string());
+        let analysis = self.get_line_analysis(ctx.file.to_path_buf());
+        analysis.ignore_tokens(&module.mod_token);
+        let should_cover = self.check_attr_list(&module.attrs, ctx);
+        if should_cover {
             if let Some((_, ref items)) = module.content {
                 self.process_items(items, ctx);
             }
         } else {
-            // Get the file or directory name of the module
-            let mut p = if let Some(parent) = ctx.file.parent() {
-                parent.join(module.ident.to_string())
+            if let Some((ref braces, _)) = module.content {
+                let analysis = self.get_line_analysis(ctx.file.to_path_buf());
+                analysis.ignore_span(braces.span.join());
+                if let Some((_, ref items)) = module.content {
+                    self.ignore_nested_modules(items, ctx);
+                }
             } else {
-                PathBuf::from(module.ident.to_string())
-            };
-            if !p.exists() {
-                p.set_extension("rs");
+                // This item was determined not to be covered, so we ignore it.
+                // Do a best-effort calculation of the path of the module
+                // corresponding to the mod item to ignore it.
+
+                // Get the file or directory name of the module containing the mod item
+                let mut p = if let Some(parent) = ctx.file.parent() {
+                    parent.to_path_buf()
+                } else {
+                    PathBuf::new()
+                };
+                match ctx.file.file_stem().and_then(|x| x.to_str()) {
+                    Some(name) if ["lib", "mod", "main"].contains(&name) => {
+                        // skip because these segments are transparent in module tree
+                    }
+                    Some(name) => p.push(name),
+                    None => warn!(
+                        "Could not read file stem of {:?}; sub-module path may be wrong",
+                        ctx.file
+                    ),
+                }
+                let stack = ctx.symbol_stack.borrow();
+                for s in stack.iter().take(stack.len() - 1) {
+                    p.push(s);
+                }
+                p.push(module.ident.to_string());
+                if !p.exists() {
+                    p.set_extension("rs");
+                }
+                ctx.ignore_mods.borrow_mut().insert(p);
             }
-            ctx.ignore_mods.borrow_mut().insert(p);
         }
     }
 
     fn visit_fn(&mut self, func: &ItemFn, ctx: &Context, force_cover: bool) {
+        let _guard = ctx.push_to_symbol_stack(func.sig.ident.to_string());
+        {
+            let analysis = self.get_line_analysis(ctx.file.to_path_buf());
+            let span = func.span();
+            analysis.functions.insert(
+                ctx.get_qualified_name(),
+                (func.sig.span().start().line, span.end().line),
+            );
+        }
         let mut test_func = false;
         let mut ignored_attr = false;
         let mut is_inline = false;
         let mut ignore_span = false;
-        let is_generic = !func.sig.generics.params.is_empty();
+        let is_generic = is_sig_generic(&func.sig);
         for attr in &func.attrs {
-            if let Ok(x) = attr.parse_meta() {
-                let id = x.path();
-                if id.is_ident("test") {
-                    test_func = true;
-                } else if id.is_ident("derive") {
-                    let analysis = self.get_line_analysis(ctx.file.to_path_buf());
-                    analysis.ignore_span(attr.bracket_token.span);
-                } else if id.is_ident("inline") {
-                    is_inline = true;
-                } else if id.is_ident("ignore") {
-                    ignored_attr = true;
-                } else if check_cfg_attr(&x) {
-                    ignore_span = true;
-                    break;
-                }
+            let id = attr.path();
+            if id.is_ident("test") || id.segments.last().is_some_and(|seg| seg.ident == "test") {
+                test_func = true;
+            } else if id.is_ident("derive") {
+                let analysis = self.get_line_analysis(ctx.file.to_path_buf());
+                analysis.ignore_span(attr.span());
+            } else if id.is_ident("inline") {
+                is_inline = true;
+            } else if id.is_ident("ignore") {
+                ignored_attr = true;
+            } else if check_cfg_attr(&attr.meta) {
+                ignore_span = true;
+                break;
             }
         }
         if ignore_span
-            || (test_func && ctx.config.ignore_tests())
+            || (test_func && !ctx.config.include_tests())
             || (ignored_attr && !ctx.config.run_ignored)
         {
             let analysis = self.get_line_analysis(ctx.file.to_path_buf());
@@ -128,7 +167,7 @@ impl SourceAnalysis {
             if is_inline || is_generic || force_cover {
                 let analysis = self.get_line_analysis(ctx.file.to_path_buf());
                 // We need to force cover!
-                analysis.cover_span(func.block.brace_token.span, Some(ctx.file_contents));
+                analysis.cover_span(func.block.span(), Some(ctx.file_contents));
             }
             if self
                 .process_statements(&func.block.stmts, ctx)
@@ -143,6 +182,13 @@ impl SourceAnalysis {
             self.visit_generics(&func.sig.generics, ctx);
             let analysis = self.get_line_analysis(ctx.file.to_path_buf());
             let line_number = func.sig.fn_token.span().start().line;
+            let mut start_line = line_number;
+            for attr in &func.attrs {
+                start_line = start_line.min(attr.span().start().line);
+            }
+            if start_line < line_number {
+                analysis.add_to_ignore(start_line..line_number);
+            }
             analysis.ignore.remove(&Lines::Line(line_number));
             // Ignore multiple lines of fn decl
             let decl_start = func.sig.fn_token.span().start().line + 1;
@@ -153,10 +199,11 @@ impl SourceAnalysis {
     }
 
     fn visit_trait(&mut self, trait_item: &ItemTrait, ctx: &Context) {
+        let _guard = ctx.push_to_symbol_stack(trait_item.ident.to_string());
         let check_cover = self.check_attr_list(&trait_item.attrs, ctx);
         if check_cover {
             for item in &trait_item.items {
-                if let TraitItem::Method(ref i) = *item {
+                if let TraitItem::Fn(ref i) = *item {
                     if self.check_attr_list(&i.attrs, ctx) {
                         let item = i.clone();
                         if let Some(block) = item.default {
@@ -164,6 +211,7 @@ impl SourceAnalysis {
                                 attrs: item.attrs,
                                 // Trait functions inherit visibility from the trait
                                 vis: trait_item.vis.clone(),
+                                modifiers: item.modifiers,
                                 sig: item.sig,
                                 block: Box::new(block),
                             };
@@ -191,22 +239,47 @@ impl SourceAnalysis {
     }
 
     fn visit_impl(&mut self, impl_blk: &ItemImpl, ctx: &Context) {
+        let self_ty_name = impl_blk
+            .self_ty
+            .to_token_stream()
+            .to_string()
+            .replace(' ', "");
+        let _guard = match &impl_blk.trait_ {
+            Some((path, _)) => {
+                let trait_name = path
+                    .segments
+                    .last()
+                    .map(|x| x.ident.to_string())
+                    .unwrap_or_else(|| path.to_token_stream().to_string());
+                let name = format!("<impl {} for {}>", trait_name, self_ty_name);
+                ctx.push_to_symbol_stack(name)
+            }
+            None => ctx.push_to_symbol_stack(self_ty_name),
+        };
         let check_cover = self.check_attr_list(&impl_blk.attrs, ctx);
         if check_cover {
             for item in &impl_blk.items {
-                if let ImplItem::Method(ref i) = *item {
-                    let item = i.clone();
-                    let item_fn = ItemFn {
-                        attrs: item.attrs,
-                        vis: item.vis,
-                        sig: item.sig,
-                        block: Box::new(item.block),
-                    };
+                match *item {
+                    ImplItem::Fn(ref i) => {
+                        let item = i.clone();
+                        let item_fn = ItemFn {
+                            attrs: item.attrs,
+                            vis: item.vis,
+                            modifiers: item.modifiers,
+                            sig: item.sig,
+                            block: Box::new(item.block),
+                        };
 
-                    // If the impl is on a generic, we need to force cover
-                    let force_cover = !impl_blk.generics.params.is_empty();
+                        // If the impl is on a generic, we need to force cover
+                        let force_cover = !impl_blk.generics.params.is_empty();
 
-                    self.visit_fn(&item_fn, ctx, force_cover);
+                        self.visit_fn(&item_fn, ctx, force_cover);
+                    }
+                    ImplItem::Type(_) => {
+                        let analysis = self.get_line_analysis(ctx.file.to_path_buf());
+                        analysis.ignore_span(item.span());
+                    }
+                    _ => {}
                 }
             }
             self.visit_generics(&impl_blk.generics, ctx);
@@ -215,4 +288,19 @@ impl SourceAnalysis {
             analysis.ignore_tokens(impl_blk);
         }
     }
+}
+
+fn has_generic_arg<'a>(args: impl Iterator<Item = &'a FnArg>) -> bool {
+    for arg in args {
+        if let FnArg::Typed(pat) = arg {
+            if matches!(*pat.ty, Type::ImplTrait(_)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_sig_generic(sig: &Signature) -> bool {
+    !sig.generics.params.is_empty() || has_generic_arg(sig.inputs.iter())
 }

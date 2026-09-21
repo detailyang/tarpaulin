@@ -1,33 +1,41 @@
 use crate::source_analysis::prelude::*;
-use proc_macro2::{TokenStream, TokenTree};
-use quote::ToTokens;
+use proc_macro2::TokenTree;
 use std::cmp::{max, min};
-use std::collections::HashSet;
 use std::ops::Range;
-use syn::{spanned::Spanned, *};
+
+pub fn ignore_macro_name(ident: &Ident, ctx: &Context) -> (SubResult, bool) {
+    let ident_s = ident.to_string();
+    let unreachable = ident == "unreachable";
+    let standard_ignores =
+        ident == "unimplemented" || ident == "include" || ident == "cfg" || ident == "todo";
+    let ignore_panic = ctx.config.ignore_panics
+        && (ident == "panic"
+            || ident_s.starts_with("assert")
+            || ident_s.starts_with("debug_assert"));
+    let sub = if unreachable {
+        SubResult::Unreachable
+    } else {
+        SubResult::Ok
+    };
+    let should_ignore = standard_ignores || ignore_panic || unreachable;
+    (sub, should_ignore)
+}
 
 impl SourceAnalysis {
     pub(crate) fn visit_macro_call(&mut self, mac: &Macro, ctx: &Context) -> SubResult {
         let analysis = self.get_line_analysis(ctx.file.to_path_buf());
         let mut skip = false;
         if let Some(PathSegment {
-            ref ident,
+            ident,
             arguments: _,
         }) = mac.path.segments.last()
         {
-            let ident_s = ident.to_string();
-            let unreachable = ident == "unreachable";
-            let standard_ignores =
-                ident == "unimplemented" || ident == "include" || ident == "cfg" || ident == "todo";
-            let ignore_panic = ctx.config.ignore_panics
-                && (ident == "panic"
-                    || ident_s.starts_with("assert")
-                    || ident_s.starts_with("debug_assert"));
-            if standard_ignores || ignore_panic || unreachable {
+            let (sub, ignore_macro) = ignore_macro_name(ident, ctx);
+            if ignore_macro {
                 analysis.ignore_tokens(mac);
                 skip = true;
             }
-            if unreachable {
+            if sub == SubResult::Unreachable {
                 return SubResult::Unreachable;
             }
         }

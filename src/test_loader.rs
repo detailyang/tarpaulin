@@ -1,17 +1,15 @@
-use crate::config::{types::TraceEngine, Config};
-use crate::path_utils::is_coverable_file_path;
+use crate::config::{Config, types::TraceEngine};
+use crate::path_utils::{fix_unc_path, is_coverable_file_path};
 use crate::source_analysis::*;
 use crate::traces::*;
-use gimli::read::Error;
 use gimli::*;
-use memmap::MmapOptions;
-use object::{read::ObjectSection, File as OFile, Object};
+use object::{Object, read::ObjectSection};
 use rustc_demangle::demangle;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 /// Describes a function as `low_pc`, `high_pc` and bool representing `is_test`.
 type FuncDesc = (u64, u64, FunctionType, Option<String>);
@@ -78,10 +76,10 @@ where
     Offset: ReaderOffset,
 {
     let mut func_type = FunctionType::Standard;
-    let low = die.attr_value(DW_AT_low_pc)?;
-    let high = die.attr_value(DW_AT_high_pc)?;
-    let linkage = die.attr_value(DW_AT_linkage_name)?;
-    let fn_name = die.attr_value(DW_AT_name)?;
+    let low = die.attr_value(DW_AT_low_pc);
+    let high = die.attr_value(DW_AT_high_pc);
+    let linkage = die.attr_value(DW_AT_linkage_name);
+    let fn_name = die.attr_value(DW_AT_name);
 
     let fn_name: Option<String> = match fn_name {
         Some(AttributeValue::DebugStrRef(offset)) => debug_str
@@ -136,7 +134,7 @@ where
     let mut cursor = debug_info.entries(debug_abbrev);
     // skip compilation unit root.
     let _ = cursor.next_entry();
-    while let Ok(Some((_, node))) = cursor.next_dfs() {
+    while let Ok(Some(node)) = cursor.next_dfs() {
         // Function DIE
         if node.tag() == DW_TAG_subprogram {
             if let Ok(fd) = generate_func_desc(node, debug_str) {
@@ -179,7 +177,7 @@ where
                     }
                 }
                 if let Ok(p) = path.canonicalize() {
-                    path = p;
+                    path = fix_unc_path(&p);
                 }
                 let file = file.path_name();
                 let line = ln_row.line().unwrap();
@@ -219,29 +217,36 @@ where
     Ok(())
 }
 
-fn get_line_addresses(
+fn get_line_addresses<'data>(
     endian: RunTimeEndian,
-    obj: &OFile,
+    obj: &'data impl object::read::Object<'data>,
     analysis: &HashMap<PathBuf, LineAnalysis>,
     config: &Config,
 ) -> Result<TraceMap> {
     let project = config.root();
     let io_err = |e| {
-        error!("Io error parsing section: {}", e);
+        error!("IO error parsing section: {e}");
         Error::Io
     };
+    trace!("Reading object sections");
     let mut result = TraceMap::new();
+    trace!("Reading .debug_info");
     let debug_info = obj.section_by_name(".debug_info").ok_or(Error::Io)?;
     let debug_info = DebugInfo::new(debug_info.data().map_err(io_err)?, endian);
+    trace!("Reading .debug_abbrev");
     let debug_abbrev = obj.section_by_name(".debug_abbrev").ok_or(Error::Io)?;
     let debug_abbrev = DebugAbbrev::new(debug_abbrev.data().map_err(io_err)?, endian);
+    trace!("Reading .debug_str");
     let debug_strings = obj.section_by_name(".debug_str").ok_or(Error::Io)?;
     let debug_strings = DebugStr::new(debug_strings.data().map_err(io_err)?, endian);
+    trace!("Reading .debug_line");
     let debug_line = obj.section_by_name(".debug_line").ok_or(Error::Io)?;
     let debug_line = DebugLine::new(debug_line.data().map_err(io_err)?, endian);
 
+    trace!("Reading .text");
     let base_addr = obj.section_by_name(".text").ok_or(Error::Io)?;
 
+    trace!("Reading DebugInfo units");
     let mut iter = debug_info.units();
     while let Ok(Some(cu)) = iter.next() {
         let addr_size = cu.address_size();
@@ -259,12 +264,12 @@ fn get_line_addresses(
             })
             .collect::<Vec<_>>();
 
-        if let Ok(Some((_, root))) = cu.entries(&abbr).next_dfs() {
+        if let Ok(Some(root)) = cu.entries(&abbr).next_dfs() {
             let offset = match root.attr_value(DW_AT_stmt_list) {
-                Ok(Some(AttributeValue::DebugLineRef(o))) => o,
+                Some(AttributeValue::DebugLineRef(o)) => o,
                 _ => continue,
             };
-            let prog = debug_line.program(offset, addr_size, None, None)?;
+            let prog = debug_line.program(offset, addr_size, None, None)?; // Here?
             let mut temp_map: HashMap<SourceLocation, Vec<TracerData>> = HashMap::new();
 
             if let Err(e) =
@@ -278,13 +283,12 @@ fn get_line_addresses(
                 }
                 let temp_map = temp_map
                     .into_iter()
-                    .filter(|&(ref k, _)| {
-                        !(config.ignore_tests() && k.path.starts_with(&project.join("tests")))
+                    .filter(|(k, _)| {
+                        config.include_tests() || !k.path.starts_with(project.join("tests"))
                     })
-                    .filter(|&(ref k, _)| !(config.exclude_path(&k.path)))
-                    .filter(|&(ref k, _)| {
-                        !analysis.should_ignore(k.path.as_ref(), &(k.line as usize))
-                    })
+                    .filter(|(k, _)| !(config.exclude_path(&k.path)))
+                    .filter(|(k, _)| config.include_path(&k.path))
+                    .filter(|(k, _)| !analysis.should_ignore(k.path.as_ref(), &(k.line as usize)))
                     .map(|(k, v)| {
                         let ret = analysis.normalise(k.path.as_ref(), k.line as usize);
                         let k_n = SourceLocation::from(ret);
@@ -323,32 +327,41 @@ fn get_line_addresses(
                             k.line
                         );
                     }
-                    tracemap.add_trace(&k.path, Trace::new(k.line, address, 1, fn_name));
+                    tracemap.add_trace(&k.path, Trace::new(k.line, address, 1));
                 }
                 result.merge(&tracemap);
             }
         }
     }
 
-    for (file, line_analysis) in analysis.iter() {
-        if config.exclude_path(file) {
+    add_line_analysis(analysis, config, &mut result);
+    Ok(result)
+}
+
+fn add_line_analysis(
+    in_analysis: &HashMap<PathBuf, LineAnalysis>,
+    in_config: &Config,
+    in_out_trace: &mut TraceMap,
+) {
+    for (file, line_analysis) in in_analysis.iter() {
+        if in_config.exclude_path(file) || !in_config.include_path(file) {
             continue;
         }
         for line in &line_analysis.cover {
             let line = *line as u64;
-            if !result.contains_location(file, line) && !line_analysis.should_ignore(line as usize)
+            if !in_out_trace.contains_location(file, line)
+                && !line_analysis.should_ignore(line as usize)
             {
-                let rpath = config.strip_base_dir(file);
+                let rpath = in_config.strip_base_dir(file);
                 trace!(
                     "Adding trace for potentially uncoverable line in {}:{}",
                     rpath.display(),
                     line
                 );
-                result.add_trace(file, Trace::new_stub(line));
+                in_out_trace.add_trace(file, Trace::new_stub(line));
             }
         }
     }
-    Ok(result)
 }
 
 #[cfg(ptrace_supported)]
@@ -377,32 +390,28 @@ pub fn generate_tracemap(
     analysis: &HashMap<PathBuf, LineAnalysis>,
     config: &Config,
 ) -> io::Result<TraceMap> {
+    trace!("Generating traces for {}", test.display());
     let file = match open_symbols_file(test) {
-        Ok(s) => Ok(s),
-        Err(e) if config.engine() != TraceEngine::Llvm => Err(e),
+        Ok(s) => object::read::ReadCache::new(s),
+        Err(e) if config.engine() != TraceEngine::Llvm => return Err(e),
         _ => {
             return Ok(TraceMap::new());
         }
-    }?;
-    let file = unsafe { MmapOptions::new().map(&file)? };
-    if let Ok(obj) = OFile::parse(&*file) {
-        let endian = if obj.is_little_endian() {
-            RunTimeEndian::Little
-        } else {
-            RunTimeEndian::Big
-        };
-        if let Ok(result) = get_line_addresses(endian, &obj, analysis, config) {
-            Ok(result)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Error while parsing",
-            ))
-        }
+    };
+    let obj = object::File::parse(&file).map_err(|e| {
+        error!("{}", e);
+        io::Error::new(io::ErrorKind::InvalidData, "Unable to parse binary")
+    })?;
+    let endian = if obj.is_little_endian() {
+        RunTimeEndian::Little
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Unable to parse binary.",
-        ))
-    }
+        RunTimeEndian::Big
+    };
+    get_line_addresses(endian, &obj, analysis, config)
+        .map_err(|e| {
+            // They may be running with a stripped binary or doing something weird
+            error!("Error parsing debug information from binary: {}", e);
+            warn!("Stripping symbol information can prevent tarpaulin from working. If you want to do this pass `--engine=llvm`");
+            io::Error::new(io::ErrorKind::InvalidData, "Error while parsing binary or DWARF info.")
+        })
 }

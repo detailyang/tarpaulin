@@ -1,8 +1,9 @@
+use crate::config::RunType;
+use crate::source_analysis::Function;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ord, Ordering};
 use std::collections::btree_map::Iter;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::{Display, Formatter, Result};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Add;
 use std::path::{Path, PathBuf};
 use tracing::trace;
@@ -43,7 +44,9 @@ impl Add for CoverageStat {
 
     fn add(self, other: CoverageStat) -> CoverageStat {
         match (self, other) {
-            (CoverageStat::Line(ref l), CoverageStat::Line(ref r)) => CoverageStat::Line(l + r),
+            (CoverageStat::Line(ref l), CoverageStat::Line(ref r)) => {
+                CoverageStat::Line(l.saturating_add(*r))
+            }
             (CoverageStat::Branch(ref l), CoverageStat::Branch(ref r)) => {
                 CoverageStat::Branch(l + r)
             }
@@ -52,27 +55,16 @@ impl Add for CoverageStat {
     }
 }
 
-impl Display for CoverageStat {
-    fn fmt(&self, f: &mut Formatter) -> Result {
-        match *self {
-            CoverageStat::Line(x) => write!(f, "hits: {}", x),
-            _ => write!(f, ""),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Trace {
     /// Line the trace is on in the file
     pub line: u64,
-    /// Optional address showing location in the test artefact
+    /// Optional address showing location in the test artifact
     pub address: HashSet<u64>,
     /// Length of the instruction (useful to get entire condition/branch)
     pub length: usize,
     /// Coverage stats
     pub stats: CoverageStat,
-    /// Function name
-    pub fn_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -84,13 +76,12 @@ pub struct Location {
 }
 
 impl Trace {
-    pub fn new(line: u64, address: HashSet<u64>, length: usize, fn_name: Option<String>) -> Self {
+    pub fn new(line: u64, address: HashSet<u64>, length: usize) -> Self {
         Self {
             line,
             address,
             length,
             stats: CoverageStat::Line(0),
-            fn_name,
         }
     }
 
@@ -100,7 +91,6 @@ impl Trace {
             address: HashSet::new(),
             length: 0,
             stats: CoverageStat::Line(0),
-            fn_name: None,
         }
     }
 }
@@ -118,18 +108,10 @@ impl Ord for Trace {
         self.line.cmp(&other.line)
     }
     fn max(self, other: Trace) -> Trace {
-        if self.line > other.line {
-            self
-        } else {
-            other
-        }
+        if self.line > other.line { self } else { other }
     }
     fn min(self, other: Trace) -> Trace {
-        if self.line < other.line {
-            self
-        } else {
-            other
-        }
+        if self.line < other.line { self } else { other }
     }
 }
 
@@ -166,20 +148,49 @@ pub fn coverage_percentage<'a>(traces: impl Iterator<Item = &'a Trace>) -> f64 {
     (amount_covered(t.iter().copied()) as f64) / (amount_coverable(t.iter().copied()) as f64)
 }
 
+#[derive(Debug, Default, PartialEq, Clone, Deserialize, Serialize, Ord, PartialOrd, Eq)]
+pub struct TraceMapSettings {
+    pub packages: BTreeSet<String>,
+    pub workspace: bool,
+    pub excluded_files_raw: BTreeSet<String>,
+    pub included_files_raw: BTreeSet<String>,
+    pub exclude: BTreeSet<String>,
+    pub run_types: BTreeSet<RunType>,
+    pub varargs: BTreeSet<String>,
+}
+
 /// Stores all the program traces mapped to files and provides an interface to
 /// add, query and change traces.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct TraceMap {
-    /// Traces in the program mapped to the given file
+    ///rTraces in the program mapped to the given file
     traces: BTreeMap<PathBuf, Vec<Trace>>,
+    functions: HashMap<PathBuf, Vec<Function>>,
+    settings: BTreeSet<TraceMapSettings>,
 }
 
 impl TraceMap {
     /// Create a new TraceMap
     pub fn new() -> TraceMap {
-        TraceMap {
-            traces: BTreeMap::new(),
-        }
+        Self::default()
+    }
+
+    pub fn insert_settings(&mut self, tracemap_settings: TraceMapSettings) {
+        self.settings.insert(tracemap_settings);
+    }
+
+    pub fn append_settings(&mut self, tracemap_settings: Vec<TraceMapSettings>) {
+        let mut settings_collection: BTreeSet<TraceMapSettings> =
+            tracemap_settings.into_iter().collect();
+        self.settings.append(&mut settings_collection);
+    }
+
+    pub fn get_settings(&self) -> &BTreeSet<TraceMapSettings> {
+        &self.settings
+    }
+
+    pub fn set_functions(&mut self, functions: HashMap<PathBuf, Vec<Function>>) {
+        self.functions = functions;
     }
 
     /// Returns true if there are no traces
@@ -187,8 +198,8 @@ impl TraceMap {
         self.traces.is_empty()
     }
 
-    /// Provides an interator to the underlying map of PathBufs to Vec<Trace>
-    pub fn iter(&self) -> Iter<PathBuf, Vec<Trace>> {
+    /// Provides an iterator to the underlying map of PathBufs to Vec<Trace>
+    pub fn iter(&self) -> Iter<'_, PathBuf, Vec<Trace>> {
         self.traces.iter()
     }
 
@@ -196,6 +207,8 @@ impl TraceMap {
     /// This adds records which are missing and adds the statistics gathered to
     /// existing records
     pub fn merge(&mut self, other: &TraceMap) {
+        self.functions
+            .extend(other.functions.iter().map(|(k, v)| (k.clone(), v.clone())));
         for (k, values) in other.iter() {
             if !self.traces.contains_key(k) {
                 self.traces.insert(k.clone(), values.clone());
@@ -298,17 +311,6 @@ impl TraceMap {
         }
     }
 
-    /// Gets a mutable reference to a trace at a given address
-    /// Returns None if there is no trace at that address
-    pub fn get_trace_mut(&mut self, address: u64) -> Option<&mut Trace> {
-        for val in self.all_traces_mut() {
-            if val.address.contains(&address) {
-                return Some(val);
-            }
-        }
-        None
-    }
-
     pub fn get_location(&self, address: u64) -> Option<Location> {
         for (k, v) in &self.traces {
             if let Some(s) = v
@@ -346,20 +348,11 @@ impl TraceMap {
             .flat_map(|(_, v)| v.iter())
     }
 
-    /// Gets all traces in folder, doesn't go into other folders for that you
-    /// want get_child_traces
-    pub fn get_traces<'a>(&'a self, root: &'a Path) -> impl Iterator<Item = &'a Trace> + 'a {
-        let i: Box<dyn Iterator<Item = &'a Trace> + 'a> = if root.is_file() {
-            Box::new(self.get_child_traces(root))
-        } else {
-            Box::new(
-                self.traces
-                    .iter()
-                    .filter(move |&(k, _)| k.parent() == Some(root))
-                    .flat_map(|(_, v)| v.iter()),
-            )
+    pub fn get_functions(&self, file: &Path) -> impl Iterator<Item = &Function> {
+        let i: Box<dyn Iterator<Item = &Function>> = match self.functions.get(file) {
+            Some(f) => Box::new(f.iter()),
+            None => Box::new(std::iter::empty()),
         };
-
         i
     }
 
@@ -465,7 +458,6 @@ mod tests {
             address,
             length: 0,
             stats: CoverageStat::Line(1),
-            fn_name: Some(String::from("f")),
         };
         t1.add_trace(Path::new("file.rs"), trace_1);
 
@@ -487,7 +479,6 @@ mod tests {
             address,
             length: 0,
             stats: CoverageStat::Line(1),
-            fn_name: Some(String::from("f")),
         };
         t1.add_trace(Path::new("file.rs"), a_trace.clone());
         t2.add_trace(
@@ -497,7 +488,6 @@ mod tests {
                 address: HashSet::new(),
                 length: 0,
                 stats: CoverageStat::Line(2),
-                fn_name: Some(String::from("f")),
             },
         );
 
@@ -522,7 +512,6 @@ mod tests {
             address,
             length: 0,
             stats: CoverageStat::Line(1),
-            fn_name: Some(String::from("f1")),
         };
         t1.add_trace(Path::new("file.rs"), a_trace.clone());
         t2.add_trace(
@@ -532,7 +521,6 @@ mod tests {
                 address: HashSet::new(),
                 length: 0,
                 stats: CoverageStat::Line(2),
-                fn_name: Some(String::from("f2")),
             },
         );
 
@@ -558,7 +546,6 @@ mod tests {
                 address: address.clone(),
                 length: 0,
                 stats: CoverageStat::Line(5),
-                fn_name: Some(String::from("f")),
             },
         );
         t2.add_trace(
@@ -568,7 +555,6 @@ mod tests {
                 address: address.clone(),
                 length: 0,
                 stats: CoverageStat::Line(2),
-                fn_name: Some(String::from("f")),
             },
         );
         t1.merge(&t2);
@@ -580,7 +566,6 @@ mod tests {
                 address: address.clone(),
                 length: 0,
                 stats: CoverageStat::Line(7),
-                fn_name: Some(String::from("f")),
             })
         );
         // Deduplicating should have no effect.
@@ -593,7 +578,6 @@ mod tests {
                 address,
                 length: 0,
                 stats: CoverageStat::Line(7),
-                fn_name: Some(String::from("f")),
             })
         );
     }

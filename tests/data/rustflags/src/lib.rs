@@ -1,11 +1,14 @@
+//! Dumb doc test
+//!
+//! ```rust
+//! #[cfg(not(boop))]
+//! panic!("No boop");
+//! ```
 #![allow(dead_code)]
-
-use std::env;
 
 #[test]
 fn ensure_rustflags_are_set() {
-    
-    let rust_flags: &'static str = env!("RUSTFLAGS");
+    let encoded_flags = env!("CARGO_ENCODED_RUSTFLAGS");
 
-    assert!(rust_flags.to_string().contains("target-cpu=native"))
+    assert!(encoded_flags.split('\x1f').any(|flag| flag == "-Ctarget-cpu=native"));
 }
